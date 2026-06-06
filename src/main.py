@@ -133,6 +133,32 @@ def create_audio_track_inputs(track_idx: int, track: defaultdict):
                 st.rerun()
 
 def picture_from_camera():
+    # Repere visuel : bandes grisees en haut et en bas de la camera.
+    # La bande claire centrale = la zone carree qui sera gardee au recadrage.
+    # Valeurs en pourcentage => s'adapte a l'ecran (portrait iPad).
+    st.markdown(
+        """
+        <style>
+        div[data-testid="stCameraInput"] > div { position: relative; }
+        div[data-testid="stCameraInput"] > div::after {
+            content: "";
+            position: absolute;
+            top: 0; left: 0; right: 0; bottom: 0;
+            pointer-events: none;
+            z-index: 10;
+            background:
+                linear-gradient(to bottom,
+                    rgba(0,0,0,0.45) 0%,
+                    rgba(0,0,0,0.45) 18%,
+                    rgba(0,0,0,0) 18%,
+                    rgba(0,0,0,0) 82%,
+                    rgba(0,0,0,0.45) 82%,
+                    rgba(0,0,0,0.45) 100%);
+        }
+        </style>
+        """,
+        unsafe_allow_html=True,
+    )
     picture = st.camera_input("Take a photo")
     # Band aid fix: 
     # In case the clear photo button was not pressed the st.camera_input will return the last picture taken.
