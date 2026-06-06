@@ -57,7 +57,13 @@ def main():
         st.warning("Please take at least one photo and upload an audio file.")
         return
     st.subheader("Images")
-    display_image_carousel(session_state.image_paths)
+    st.caption("Cochez les photos à inclure dans la vidéo (toutes cochées par défaut).")
+    selected_paths = display_image_selector(session_state.image_paths)
+    session_state.selected_image_paths = selected_paths
+    st.write(f"{len(selected_paths)} photo(s) sélectionnée(s) sur {len(session_state.image_paths)}.")
+    if len(selected_paths) == 0:
+        st.warning("Veuillez cocher au moins une photo.")
+        return
 
     # Videos
     if session_state.zipped_clips_s3_url is not None:
@@ -83,6 +89,7 @@ def main():
 def setup_session_state():
     session_state.tempdir = tempfile.TemporaryDirectory()
     session_state.image_paths = []
+    session_state.selected_image_paths = []
     session_state.prev_picture = None
     session_state.session_key = 0
     # list of dicts containing "file", "bpm" and "duration" keys/values
@@ -171,13 +178,25 @@ def display_image_carousel(image_paths):
     """
     html(html_code, height=180)
 
+def display_image_selector(image_paths):
+    """Affiche chaque photo avec une case a cocher. Retourne la liste des chemins coches."""
+    selected = []
+    cols = st.columns(4)
+    for idx, path in enumerate(image_paths):
+        with cols[idx % 4]:
+            st.image(path, width=140)
+            checked = st.checkbox("Inclure", value=True, key=f"select_img_{idx}")
+            if checked:
+                selected.append(path)
+    return selected
+
 def create_new_clips():
     for clip in session_state.clips:
         os.remove(clip["path"])
     session_state.clips = []
     datetime_str = datetime.now(ZoneInfo("Europe/Paris")).strftime("%d-%m-%Y:%H-%M-%S")
     for track in session_state.audio_tracks:
-        clip_path, duration = create_clip(track)
+        clip_path, duration = create_clip(track, session_state.selected_image_paths)
         s3_url = upload_file_to_bucket(clip_path, join(datetime_str, clip_path))
         session_state.clips.append({
             "path": clip_path,
@@ -188,7 +207,7 @@ def create_new_clips():
     zipped_clips_s3_url = upload_file_to_bucket(zipped_clips_path, datetime_str + ".zip")
     session_state.zipped_clips_s3_url = zipped_clips_s3_url
 
-def create_clip(track: defaultdict) -> tuple[str, float]:
+def create_clip(track: defaultdict, image_paths: list) -> tuple[str, float]:
     """
     ### Description:
     Wrapper around video_editing.create_clip to prepare its inputs.
@@ -207,7 +226,7 @@ def create_clip(track: defaultdict) -> tuple[str, float]:
     with tempfile.NamedTemporaryFile(suffix=audio_ext) as audio_file:
         audio_file.write(track["file"].getbuffer())
         video_editing.create_clip(
-            image_paths=session_state.image_paths,
+            image_paths=image_paths,
             audio_path=audio_file.name,
             bpm=track["bpm"],
             duration=track["duration"],
