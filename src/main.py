@@ -147,10 +147,10 @@ def picture_from_camera():
             background:
                 linear-gradient(to bottom,
                     rgba(0,0,0,0.45) 0%,
-                    rgba(0,0,0,0.45) 22%,
-                    rgba(0,0,0,0) 22%,
-                    rgba(0,0,0,0) 78%,
-                    rgba(0,0,0,0.45) 78%,
+                    rgba(0,0,0,0.45) 24%,
+                    rgba(0,0,0,0) 24%,
+                    rgba(0,0,0,0) 76%,
+                    rgba(0,0,0,0.45) 76%,
                     rgba(0,0,0,0.45) 100%);
         }
         </style>
