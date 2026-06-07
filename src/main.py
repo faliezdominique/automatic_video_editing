@@ -133,9 +133,8 @@ def create_audio_track_inputs(track_idx: int, track: defaultdict):
                 st.rerun()
 
 def picture_from_camera():
-    # Repere visuel : bandes grisees en haut et en bas de la camera.
-    # La bande claire centrale = la zone carree qui sera gardee au recadrage.
-    # Valeurs en pourcentage => s'adapte a l'ecran (portrait iPad).
+    # Repere carre : bandeaux gris haut/bas a 27% => bande claire centrale carree
+    # (calee sur la largeur de la photo en portrait sur iPad).
     st.markdown(
         """
         <style>
@@ -149,10 +148,10 @@ def picture_from_camera():
             background:
                 linear-gradient(to bottom,
                     rgba(0,0,0,0.45) 0%,
-                    rgba(0,0,0,0.45) 18%,
-                    rgba(0,0,0,0) 18%,
-                    rgba(0,0,0,0) 82%,
-                    rgba(0,0,0,0.45) 82%,
+                    rgba(0,0,0,0.45) 27%,
+                    rgba(0,0,0,0) 27%,
+                    rgba(0,0,0,0) 73%,
+                    rgba(0,0,0,0.45) 73%,
                     rgba(0,0,0,0.45) 100%);
         }
         </style>
