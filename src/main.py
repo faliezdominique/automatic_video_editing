@@ -133,8 +133,7 @@ def create_audio_track_inputs(track_idx: int, track: defaultdict):
                 st.rerun()
 
 def picture_from_camera():
-    # Repere carre : bandeaux gris haut/bas a 27% => bande claire centrale carree
-    # (calee sur la largeur de la photo en portrait sur iPad).
+    # Repere carre : bandeaux gris haut/bas a 22% (cale au metre sur iPad portrait).
     st.markdown(
         """
         <style>
@@ -148,10 +147,10 @@ def picture_from_camera():
             background:
                 linear-gradient(to bottom,
                     rgba(0,0,0,0.45) 0%,
-                    rgba(0,0,0,0.45) 27%,
-                    rgba(0,0,0,0) 27%,
-                    rgba(0,0,0,0) 73%,
-                    rgba(0,0,0,0.45) 73%,
+                    rgba(0,0,0,0.45) 22%,
+                    rgba(0,0,0,0) 22%,
+                    rgba(0,0,0,0) 78%,
+                    rgba(0,0,0,0.45) 78%,
                     rgba(0,0,0,0.45) 100%);
         }
         </style>
