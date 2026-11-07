@@ -1,5 +1,6 @@
 import os
 import PIL
+from PIL import Image
 import base64
 import zipfile
 import tempfile
@@ -65,6 +66,43 @@ def main():
         st.warning("Veuillez cocher au moins une photo.")
         return
 
+    # Filtre applique aux photos (sur des copies : les photos d'origine ne sont pas modifiees)
+    st.subheader("Filtre")
+    session_state.filter_name = st.selectbox("Filtre", video_editing.FILTER_NAMES, key="filter_select")
+    if session_state.filter_name == video_editing.FILTER_BW_COLORS:
+        st.caption("Couleurs à conserver (le reste passe en noir et blanc) :")
+        color_names = list(video_editing.COLOR_HUES.keys())
+        color_cols = st.columns(3)
+        kept = []
+        for i, color_name in enumerate(color_names):
+            with color_cols[i % 3]:
+                if st.checkbox(
+                    color_name,
+                    value=color_name in video_editing.DEFAULT_KEEP_COLORS,
+                    key=f"keep_color_{color_name}",
+                ):
+                    kept.append(color_name)
+        session_state.keep_colors = kept
+        session_state.sat_min = st.slider(
+            "Seuil de saturation (plus bas = garde davantage de couleurs)",
+            min_value=0.10, max_value=0.90, value=video_editing.DEFAULT_SAT_MIN, step=0.05,
+            key="sat_min_slider",
+        )
+    else:
+        session_state.keep_colors = []
+        session_state.sat_min = video_editing.DEFAULT_SAT_MIN
+    if session_state.filter_name != video_editing.FILTER_NONE:
+        with Image.open(selected_paths[0]) as im:
+            small = im.convert("RGB")
+            small.thumbnail((600, 600))
+        preview = video_editing.apply_filter(
+            small, session_state.filter_name, session_state.keep_colors, session_state.sat_min
+        )
+        st.image(preview, caption="Aperçu du filtre (1re photo sélectionnée)", width=260)
+
+    # Option : couper le son de la video (le rythme et la duree restent cales sur l'audio)
+    session_state.mute_video = st.checkbox("Couper le son de la vidéo", value=False)
+
     # Videos
     if session_state.zipped_clips_s3_url is not None:
         new_videos_col, link_col, qrcode_col = st.columns(3)
@@ -90,6 +128,10 @@ def setup_session_state():
     session_state.tempdir = tempfile.TemporaryDirectory()
     session_state.image_paths = []
     session_state.selected_image_paths = []
+    session_state.mute_video = False
+    session_state.filter_name = video_editing.FILTER_NONE
+    session_state.keep_colors = []
+    session_state.sat_min = video_editing.DEFAULT_SAT_MIN
     session_state.prev_picture = None
     session_state.session_key = 0
     # list of dicts containing "file", "bpm" and "duration" keys/values
@@ -220,7 +262,14 @@ def create_new_clips():
     session_state.clips = []
     datetime_str = datetime.now(ZoneInfo("Europe/Paris")).strftime("%d-%m-%Y:%H-%M-%S")
     for track in session_state.audio_tracks:
-        clip_path, duration = create_clip(track, session_state.selected_image_paths)
+        clip_path, duration = create_clip(
+            track,
+            session_state.selected_image_paths,
+            mute=session_state.mute_video,
+            filter_name=session_state.filter_name,
+            keep_colors=session_state.keep_colors,
+            sat_min=session_state.sat_min,
+        )
         s3_url = upload_file_to_bucket(clip_path, join(datetime_str, clip_path))
         session_state.clips.append({
             "path": clip_path,
@@ -231,7 +280,14 @@ def create_new_clips():
     zipped_clips_s3_url = upload_file_to_bucket(zipped_clips_path, datetime_str + ".zip")
     session_state.zipped_clips_s3_url = zipped_clips_s3_url
 
-def create_clip(track: defaultdict, image_paths: list) -> tuple[str, float]:
+def create_clip(
+    track: defaultdict,
+    image_paths: list,
+    mute: bool = False,
+    filter_name: str = video_editing.FILTER_NONE,
+    keep_colors=None,
+    sat_min: float = video_editing.DEFAULT_SAT_MIN,
+) -> tuple[str, float]:
     """
     ### Description:
     Wrapper around video_editing.create_clip to prepare its inputs.
@@ -254,7 +310,11 @@ def create_clip(track: defaultdict, image_paths: list) -> tuple[str, float]:
             audio_path=audio_file.name,
             bpm=track["bpm"],
             duration=track["duration"],
-            output_path=video_filename
+            output_path=video_filename,
+            mute=mute,
+            filter_name=filter_name,
+            keep_colors=keep_colors,
+            sat_min=sat_min,
         )
         return video_filename, track["duration"]
 
