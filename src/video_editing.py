@@ -3,9 +3,91 @@ from PIL import Image
 from os import listdir
 from os.path import join
 from shutil import copytree
+from tempfile import mkdtemp
+
+import numpy as np
+from PIL import ImageFilter
 
 from moviepy.video.fx import Rotate, Crop
 from moviepy import Clip, ImageSequenceClip, AudioFileClip, clips_array
+
+
+# ---------------------------------------------------------------------------
+# Filtres
+# ---------------------------------------------------------------------------
+FILTER_NONE = "Aucun"
+FILTER_BW = "Noir et blanc"
+FILTER_SEPIA = "Sépia"
+FILTER_BW_COLORS = "Noir et blanc + couleurs conservées"
+FILTER_NAMES = [FILTER_NONE, FILTER_BW, FILTER_SEPIA, FILTER_BW_COLORS]
+
+# Plages de teinte en degres (debut, fin). Si debut > fin, la plage passe par 0 (rouge).
+COLOR_HUES = {
+    "Rouge": (342, 18),
+    "Orange": (18, 45),
+    "Jaune": (45, 70),
+    "Vert": (70, 180),
+    "Bleu": (180, 260),
+    "Rose": (290, 342),
+    "Violet": (260, 290),
+}
+DEFAULT_KEEP_COLORS = ["Rouge", "Jaune", "Bleu"]
+DEFAULT_SAT_MIN = 0.40
+
+
+def _hue_in_range(hue_deg, start, end):
+    if start <= end:
+        return (hue_deg >= start) & (hue_deg <= end)
+    return (hue_deg >= start) | (hue_deg <= end)
+
+
+def apply_filter(img, filter_name=FILTER_NONE, keep_colors=None, sat_min=DEFAULT_SAT_MIN):
+    """Retourne une copie filtree de l'image PIL (RGB). Ne modifie pas l'original."""
+    img = img.convert("RGB")
+    if filter_name == FILTER_BW:
+        return img.convert("L").convert("RGB")
+    if filter_name == FILTER_SEPIA:
+        a = np.array(img).astype(float)
+        r = 0.393 * a[..., 0] + 0.769 * a[..., 1] + 0.189 * a[..., 2]
+        g = 0.349 * a[..., 0] + 0.686 * a[..., 1] + 0.168 * a[..., 2]
+        b = 0.272 * a[..., 0] + 0.534 * a[..., 1] + 0.131 * a[..., 2]
+        out = np.stack([r, g, b], axis=-1).clip(0, 255).astype("uint8")
+        return Image.fromarray(out)
+    if filter_name == FILTER_BW_COLORS:
+        keep_colors = keep_colors or []
+        gray = img.convert("L").convert("RGB")
+        if not keep_colors:
+            return gray
+        hsv = np.array(img.convert("HSV")).astype(float)
+        hue = hsv[..., 0] * 360.0 / 255.0
+        sat = hsv[..., 1] / 255.0
+        val = hsv[..., 2] / 255.0
+        in_hue = np.zeros(hue.shape, dtype=bool)
+        for name in keep_colors:
+            start, end = COLOR_HUES[name]
+            in_hue |= _hue_in_range(hue, start, end)
+        mask = (in_hue & (sat > sat_min) & (val > 0.15)).astype("uint8") * 255
+        radius = max(1.0, min(img.size) / 400.0)
+        mask = np.array(Image.fromarray(mask).filter(ImageFilter.GaussianBlur(radius)))
+        m = mask.astype(float)[..., None] / 255.0
+        out = np.array(gray).astype(float) * (1 - m) + np.array(img).astype(float) * m
+        return Image.fromarray(out.clip(0, 255).astype("uint8"))
+    return img
+
+
+def apply_filter_to_files(image_paths, filter_name, keep_colors, sat_min):
+    """Cree des COPIES filtrees dans un dossier temporaire et renvoie leurs chemins."""
+    if filter_name == FILTER_NONE:
+        return image_paths
+    out_dir = mkdtemp()
+    filtered = []
+    for i, path in enumerate(image_paths):
+        with Image.open(path) as im:
+            res = apply_filter(im, filter_name, keep_colors, sat_min)
+        fp = join(out_dir, f"filtered_{i}.jpg")
+        res.save(fp, quality=95)
+        filtered.append(fp)
+    return filtered
 
 
 def create_clip(
@@ -13,9 +95,15 @@ def create_clip(
     audio_path: str,
     bpm: float,
     duration: float,
-    output_path: str
+    output_path: str,
+    mute: bool = False,
+    filter_name: str = FILTER_NONE,
+    keep_colors=None,
+    sat_min: float = DEFAULT_SAT_MIN,
 ):
     center_crop_to_square(image_paths)
+    # Filtre applique sur des copies (les photos d'origine restent intactes)
+    image_paths = apply_filter_to_files(image_paths, filter_name, keep_colors, sat_min)
     # Load audio
     audio = AudioFileClip(audio_path).with_duration(duration)
     fps = bpm / 60
@@ -25,23 +113,32 @@ def create_clip(
     # Build the video
     clip = ImageSequenceClip(paths, fps=fps)
     # clip = crop_clip_to_square(clip)
-    clip = (
-        clips_array([
-            [clip, clip.with_effects([Rotate(270)])],
-            [clip.with_effects([Rotate(90)]), clip.with_effects([Rotate(180)])],
-        ])
-        .with_audio(audio)
-    )
+    clip = clips_array([
+        [clip, clip.with_effects([Rotate(270)])],
+        [clip.with_effects([Rotate(90)]), clip.with_effects([Rotate(180)])],
+    ])
+    # Attacher l'audio sauf en mode muet (rythme et duree restent calcules sur l'audio)
+    if not mute:
+        clip = clip.with_audio(audio)
     # Write file
-    clip.write_videofile(
-        output_path,
-        fps=fps,
-        codec="libx264",
-        audio_codec="aac",
-        temp_audiofile="temp-audio.m4a",
-        remove_temp=True,
-        write_logfile=False,
-    )
+    if mute:
+        clip.write_videofile(
+            output_path,
+            fps=fps,
+            codec="libx264",
+            audio=False,
+            write_logfile=False,
+        )
+    else:
+        clip.write_videofile(
+            output_path,
+            fps=fps,
+            codec="libx264",
+            audio_codec="aac",
+            temp_audiofile="temp-audio.m4a",
+            remove_temp=True,
+            write_logfile=False,
+        )
     return output_path
 
 
