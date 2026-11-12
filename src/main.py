@@ -28,134 +28,42 @@ from config import (
 from s3_utils import upload_file_to_bucket
 
 
+MODE_PHOTO = "📷 Photos"
+MODE_VIDEO = "🎬 Vidéo"
+
+# Position du gros bouton de prise de photo (fixe a l'ecran, pour pouvoir
+# appuyer depuis le cote sans etre dans le champ de la camera).
+BUTTON_POSITIONS = {
+    "Bas gauche": "bottom: 24px; left: 24px;",
+    "Haut gauche": "top: 72px; left: 24px;",
+    "Bas droite": "bottom: 24px; right: 24px;",
+    "Haut droite": "top: 72px; right: 24px;",
+}
+DEFAULT_BUTTON_POSITION = "Bas gauche"
+
+
 def main():
     if "tempdir" not in session_state:
         setup_session_state()
+    ensure_state()
     st.title("Video Clip Creator")
-    # Audio tracks
-    st.subheader("Audio tracks")
-    # Add audio track
-    if st.button(r"\+ audio track"):
-        session_state.audio_tracks.append(mk_track_dict())
-    # audio track inputs
-    for track_idx, track in enumerate(session_state.audio_tracks):
-        create_audio_track_inputs(track_idx, track)
-    track_has_file = lambda track: track["file"] is not None
-    if not all(map(track_has_file, session_state.audio_tracks)):
-        st.warning("Please provide an audio file for all the audio tracks.")
-        return
-
-    # Pictures
-    st.subheader("Pictures")
-    # Reset pictures
-    if st.button("Reset Photos"):
-        session_state.image_paths = []
-    # Take pictures
-    picture_from_camera()
-    images_uploader()
-    # Display nb of pictures taken
-    st.write(f"{len(session_state.image_paths)} photo(s) taken.")
-    # Check that at least one picture has been taken
-    if len(session_state.image_paths) == 0:
-        st.warning("Please take at least one photo and upload an audio file.")
-        return
-    st.subheader("Images")
-    st.caption("Cochez les photos à inclure dans la vidéo (toutes cochées par défaut).")
-    selected_paths = display_image_selector(session_state.image_paths)
-    session_state.selected_image_paths = selected_paths
-    st.write(f"{len(selected_paths)} photo(s) sélectionnée(s) sur {len(session_state.image_paths)}.")
-    if len(selected_paths) == 0:
-        st.warning("Veuillez cocher au moins une photo.")
-        return
-
-    # Reglages et filtre appliques a toutes les photos (sur des copies : les originaux ne sont pas modifies)
-    st.subheader("Réglages et filtre")
-    bright_col, contrast_col = st.columns(2)
-    with bright_col:
-        session_state.brightness = st.slider(
-            "Luminosité", min_value=-50, max_value=50, value=video_editing.DEFAULT_BRIGHTNESS,
-            step=5, key="brightness_slider",
-        )
-    with contrast_col:
-        session_state.contrast = st.slider(
-            "Contraste", min_value=-50, max_value=50, value=video_editing.DEFAULT_CONTRAST,
-            step=5, key="contrast_slider",
-        )
-    temp_col, tint_col = st.columns(2)
-    with temp_col:
-        session_state.temperature = st.slider(
-            "Température (− froid / + chaud)", min_value=-50, max_value=50,
-            value=video_editing.DEFAULT_TEMPERATURE, step=5, key="temperature_slider",
-        )
-    with tint_col:
-        session_state.tint = st.slider(
-            "Teinte (− vert / + magenta)", min_value=-50, max_value=50,
-            value=video_editing.DEFAULT_TINT, step=5, key="tint_slider",
-        )
-    session_state.filter_name = st.selectbox("Filtre", video_editing.FILTER_NAMES, key="filter_select")
-    if session_state.filter_name == video_editing.FILTER_BW_COLORS:
-        st.caption("Couleurs à conserver (le reste passe en noir et blanc) :")
-        color_names = list(video_editing.COLOR_HUES.keys())
-        color_cols = st.columns(3)
-        kept = []
-        for i, color_name in enumerate(color_names):
-            with color_cols[i % 3]:
-                if st.checkbox(
-                    color_name,
-                    value=color_name in video_editing.DEFAULT_KEEP_COLORS,
-                    key=f"keep_color_{color_name}",
-                ):
-                    kept.append(color_name)
-        session_state.keep_colors = kept
-        session_state.sat_min = st.slider(
-            "Seuil de saturation (plus bas = garde davantage de couleurs)",
-            min_value=0.10, max_value=0.90, value=video_editing.DEFAULT_SAT_MIN, step=0.05,
-            key="sat_min_slider",
-        )
+    settings_section()
+    mode = st.radio(
+        "Mode",
+        [MODE_PHOTO, MODE_VIDEO],
+        horizontal=True,
+        key="mode",
+        label_visibility="collapsed",
+    )
+    if mode == MODE_PHOTO:
+        photo_section()
     else:
-        session_state.keep_colors = []
-        session_state.sat_min = video_editing.DEFAULT_SAT_MIN
-    if (
-        session_state.filter_name != video_editing.FILTER_NONE
-        or session_state.brightness != 0
-        or session_state.contrast != 0
-        or session_state.temperature != 0
-        or session_state.tint != 0
-    ):
-        with Image.open(selected_paths[0]) as im:
-            small = im.convert("RGB")
-            small.thumbnail((600, 600))
-        preview = video_editing.apply_filter(
-            small, session_state.filter_name, session_state.keep_colors, session_state.sat_min,
-            session_state.brightness, session_state.contrast,
-            session_state.temperature, session_state.tint,
-        )
-        st.image(preview, caption="Aperçu des réglages (1re photo sélectionnée)", width=260)
+        video_section()
 
-    # Option : couper le son de la video (le rythme et la duree restent cales sur l'audio)
-    session_state.mute_video = st.checkbox("Couper le son de la vidéo", value=False)
 
-    # Videos
-    if session_state.zipped_clips_s3_url is not None:
-        new_videos_col, link_col, qrcode_col = st.columns(3)
-        with new_videos_col:
-            create = st.button("Create new videos")
-        with link_col:
-            st.markdown(f"[link to all videos]({session_state.zipped_clips_s3_url})")
-        with qrcode_col:
-            qr_img = generate_qr_code(session_state.zipped_clips_s3_url)
-            st.image(qr_img, caption="Scan to download zip file")
-    else:
-        create = st.button("Create new videos")
-    if create:
-        create_new_clips()
-        st.rerun()
-    for clip in session_state.clips:
-        try:
-            display_video(clip)
-        except st.errors.StreamlitDuplicateElementKey:
-            st.text(DUPLICATE_VIDEO_DOWNLOAD_KEY)
-
+# ---------------------------------------------------------------------------
+# Etat de la session
+# ---------------------------------------------------------------------------
 def setup_session_state():
     session_state.tempdir = tempfile.TemporaryDirectory()
     session_state.image_paths = []
@@ -173,9 +81,27 @@ def setup_session_state():
     session_state.session_key = 0
     # list of dicts containing "file", "bpm" and "duration" keys/values
     session_state.audio_tracks = [mk_track_dict()]
-    # List of dicts with "path" and "s3_url" keys/values 
+    # List of dicts with "path" and "s3_url" keys/values
     session_state.clips = []
     session_state.zipped_clips_s3_url = None
+
+
+def ensure_state():
+    """Valeurs par defaut de l'etat ajoute par la version avec historique (sessions deja ouvertes comprises)."""
+    defaults = {
+        "event_name": lambda: "",
+        "history": lambda: [],
+        "video_counter": lambda: 0,
+        "photo_counter": lambda: 0,
+        "series_key": lambda: 0,
+        "unchecked": lambda: set(),
+        "camera_key": lambda: 0,
+        "photo_added": lambda: False,
+    }
+    for key, factory in defaults.items():
+        if key not in session_state:
+            session_state[key] = factory()
+
 
 def mk_track_dict() -> defaultdict:
     return defaultdict(
@@ -183,6 +109,120 @@ def mk_track_dict() -> defaultdict:
             bpm=DEFAULT_BPM,
             duration=DEFAULT_DURATION
         )
+
+
+def selected_paths() -> list:
+    """Photos cochees (toutes par defaut). La selection est gardee dans l'etat de la session."""
+    return [p for p in session_state.image_paths if p not in session_state.unchecked]
+
+
+# ---------------------------------------------------------------------------
+# Reglages de la soiree (a faire une fois, puis on replie)
+# ---------------------------------------------------------------------------
+def settings_section():
+    with st.expander("⚙️ Réglages de la soirée", expanded=True):
+        session_state.event_name = st.text_input(
+            "Nom de l'événement (sert à nommer les vidéos)",
+            key="event_name_input",
+            placeholder="ex : Soirée EDF",
+        )
+
+        st.markdown("**Son**")
+        if st.button(r"\+ audio track"):
+            session_state.audio_tracks.append(mk_track_dict())
+        for track_idx, track in enumerate(session_state.audio_tracks):
+            create_audio_track_inputs(track_idx, track)
+
+        st.markdown("**Image**")
+        bright_col, contrast_col = st.columns(2)
+        with bright_col:
+            session_state.brightness = st.slider(
+                "Luminosité", min_value=-50, max_value=50, value=video_editing.DEFAULT_BRIGHTNESS,
+                step=5, key="brightness_slider",
+            )
+        with contrast_col:
+            session_state.contrast = st.slider(
+                "Contraste", min_value=-50, max_value=50, value=video_editing.DEFAULT_CONTRAST,
+                step=5, key="contrast_slider",
+            )
+        temp_col, tint_col = st.columns(2)
+        with temp_col:
+            session_state.temperature = st.slider(
+                "Température (− froid / + chaud)", min_value=-50, max_value=50,
+                value=video_editing.DEFAULT_TEMPERATURE, step=5, key="temperature_slider",
+            )
+        with tint_col:
+            session_state.tint = st.slider(
+                "Teinte (− vert / + magenta)", min_value=-50, max_value=50,
+                value=video_editing.DEFAULT_TINT, step=5, key="tint_slider",
+            )
+        session_state.filter_name = st.selectbox("Filtre", video_editing.FILTER_NAMES, key="filter_select")
+        if session_state.filter_name == video_editing.FILTER_BW_COLORS:
+            st.caption("Couleurs à conserver (le reste passe en noir et blanc) :")
+            color_names = list(video_editing.COLOR_HUES.keys())
+            color_cols = st.columns(3)
+            kept = []
+            for i, color_name in enumerate(color_names):
+                with color_cols[i % 3]:
+                    if st.checkbox(
+                        color_name,
+                        value=color_name in video_editing.DEFAULT_KEEP_COLORS,
+                        key=f"keep_color_{color_name}",
+                    ):
+                        kept.append(color_name)
+            session_state.keep_colors = kept
+            session_state.sat_min = st.slider(
+                "Seuil de saturation (plus bas = garde davantage de couleurs)",
+                min_value=0.10, max_value=0.90, value=video_editing.DEFAULT_SAT_MIN, step=0.05,
+                key="sat_min_slider",
+            )
+        else:
+            session_state.keep_colors = []
+            session_state.sat_min = video_editing.DEFAULT_SAT_MIN
+
+        # Option : couper le son de la video (le rythme et la duree restent cales sur l'audio)
+        session_state.mute_video = st.checkbox("Couper le son de la vidéo", value=False, key="mute_checkbox")
+
+        st.markdown("**Bouton photo**")
+        st.selectbox(
+            "Position du gros bouton de prise de photo",
+            list(BUTTON_POSITIONS),
+            index=list(BUTTON_POSITIONS).index(DEFAULT_BUTTON_POSITION),
+            key="btn_pos",
+        )
+
+        # Apercu des reglages sur la premiere photo cochee
+        paths = selected_paths()
+        adjusted = (
+            session_state.filter_name != video_editing.FILTER_NONE
+            or session_state.brightness != 0
+            or session_state.contrast != 0
+            or session_state.temperature != 0
+            or session_state.tint != 0
+        )
+        if paths and adjusted:
+            preview = preview_image(paths[0], width=600)
+            st.image(preview, caption="Aperçu des réglages (1re photo cochée)", width=260)
+        elif not paths:
+            st.caption("Prenez une photo pour voir l'aperçu des réglages.")
+
+
+def preview_image(path: str, width: int = 600):
+    """Retourne une petite version de la photo avec les reglages et le filtre courants."""
+    with Image.open(path) as im:
+        small = im.convert("RGB")
+        small.thumbnail((width, width))
+    return video_editing.apply_filter(
+        small,
+        session_state.filter_name,
+        session_state.keep_colors,
+        session_state.sat_min,
+        session_state.brightness,
+        session_state.contrast,
+        session_state.temperature,
+        session_state.tint,
+    )
+
 
 def create_audio_track_inputs(track_idx: int, track: defaultdict):
     spec = [3, 1, 1, 1] if track_idx else [3, 1, 1]
@@ -211,6 +251,45 @@ def create_audio_track_inputs(track_idx: int, track: defaultdict):
                 del session_state.audio_tracks[track_idx]
                 st.rerun()
 
+
+# ---------------------------------------------------------------------------
+# Mode Photos : camera, photos de la serie en cours
+# ---------------------------------------------------------------------------
+def photo_section():
+    picture_from_camera()
+    nb_all = len(session_state.image_paths)
+    nb_sel = len(selected_paths())
+    info_col, reset_col = st.columns([3, 1])
+    with info_col:
+        st.write(f"{nb_all} photo(s) prise(s) — {nb_sel} cochée(s) pour la vidéo.")
+    with reset_col:
+        st.button("Reset Photos", on_click=reset_photos)
+    if nb_all:
+        st.caption("Décochez les photos à écarter de la vidéo.")
+        display_image_selector(session_state.image_paths)
+    with st.expander("Envoyer des photos depuis cet appareil"):
+        images_uploader()
+    # Espace en bas de page : le gros bouton fixe ne masque pas le contenu
+    st.markdown('<div style="height: 180px"></div>', unsafe_allow_html=True)
+
+
+def reset_photos():
+    """Demarre une nouvelle serie : vide la liste des photos et la selection."""
+    session_state.image_paths = []
+    session_state.unchecked = set()
+    session_state.series_key += 1
+
+
+def new_series():
+    reset_photos()
+    session_state.mode = MODE_PHOTO
+
+
+def next_photo_path(prefix: str) -> str:
+    session_state.photo_counter += 1
+    return os.path.join(session_state.tempdir.name, f"{prefix}_{session_state.photo_counter}.jpg")
+
+
 def picture_from_camera():
     # Repere carre : bandeaux gris haut/bas a 22% (cale au metre sur iPad portrait).
     st.markdown(
@@ -236,24 +315,42 @@ def picture_from_camera():
         """,
         unsafe_allow_html=True,
     )
+    # Gros bouton rond de prise de photo, fixe a l'ecran, a l'endroit choisi dans les reglages.
+    position_css = BUTTON_POSITIONS.get(session_state.get("btn_pos"), BUTTON_POSITIONS[DEFAULT_BUTTON_POSITION])
+    st.markdown(
+        f"""
+        <style>
+        div[data-testid="stCameraInput"] button[data-testid="stCameraInputButton"] {{
+            position: fixed;
+            {position_css}
+            z-index: 1000;
+            width: 130px;
+            height: 130px;
+            border-radius: 50%;
+            font-size: 1.05rem;
+            font-weight: 700;
+            box-shadow: 0 4px 14px rgba(0,0,0,0.35);
+        }}
+        </style>
+        """,
+        unsafe_allow_html=True,
+    )
     # Retour rapide a la video : apres chaque photo, on change la cle du widget camera,
     # ce qui l'affiche de nouveau en direct (plus besoin de "Clear photo").
     # Les photos prises restent en dessous, decochables si elles ne conviennent pas.
-    if "camera_key" not in session_state:
-        session_state.camera_key = 0
     if session_state.get("photo_added"):
         session_state.photo_added = False
         st.toast(f"Photo {len(session_state.image_paths)} enregistrée ✓")
     picture = st.camera_input("Take a photo", key=f"camera_{session_state.camera_key}")
     if picture is not None:
-        img_idx = len(session_state.image_paths)
-        image_path = os.path.join(session_state.tempdir.name, f"photo_{img_idx}.jpg")
+        image_path = next_photo_path("photo")
         with open(image_path, "wb") as f:
             f.write(picture.getbuffer())
         session_state.image_paths.append(image_path)
         session_state.camera_key += 1
         session_state.photo_added = True
         st.rerun()
+
 
 def images_uploader():
     # Add image uploader to upload multiple images
@@ -265,13 +362,13 @@ def images_uploader():
     )
     if uploaded_images:
         for uploaded_img in uploaded_images:
-            img_idx = len(session_state.image_paths)
-            image_path = os.path.join(session_state.tempdir.name, f"uploaded_{img_idx}.jpg")
+            image_path = next_photo_path("uploaded")
             with open(image_path, "wb") as f:
                 f.write(uploaded_img.getbuffer())
             session_state.image_paths.append(image_path)
         session_state.session_key += 1
         st.rerun()
+
 
 def display_image_carousel(image_paths):
     # Read and encode all images to base64
@@ -288,27 +385,123 @@ def display_image_carousel(image_paths):
     """
     html(html_code, height=180)
 
+
 def display_image_selector(image_paths):
-    """Affiche chaque photo avec une case a cocher. Retourne la liste des chemins coches."""
-    selected = []
+    """
+    Affiche chaque photo avec une case a cocher.
+    La selection est memorisee dans session_state.unchecked (les photos decochees),
+    pour rester correcte quand on change de mode ou qu'on demarre une nouvelle serie.
+    """
     cols = st.columns(4)
     for idx, path in enumerate(image_paths):
         with cols[idx % 4]:
             st.image(path, width=140)
-            checked = st.checkbox("Inclure", value=True, key=f"select_img_{idx}")
+            checked = st.checkbox(
+                "Inclure",
+                value=path not in session_state.unchecked,
+                key=f"select_img_{session_state.series_key}_{idx}",
+            )
             if checked:
-                selected.append(path)
-    return selected
+                session_state.unchecked.discard(path)
+            else:
+                session_state.unchecked.add(path)
+
+
+# ---------------------------------------------------------------------------
+# Mode Video : creation, derniere video, historique
+# ---------------------------------------------------------------------------
+def video_section():
+    paths = selected_paths()
+    nb_all = len(session_state.image_paths)
+    if nb_all == 0:
+        st.warning("Aucune photo pour le moment : passez en mode « Photos ».")
+    elif not paths:
+        st.warning("Toutes les photos sont décochées : repassez en mode « Photos » pour en cocher au moins une.")
+    else:
+        st.write(f"{len(paths)} photo(s) sélectionnée(s) sur {nb_all}.")
+    track_has_file = lambda track: track["file"] is not None
+    if not all(map(track_has_file, session_state.audio_tracks)):
+        st.warning("Ajoutez un fichier audio pour chaque piste dans les réglages de la soirée.")
+    can_create = bool(paths) and all(map(track_has_file, session_state.audio_tracks))
+
+    create = st.button("Créer la vidéo", type="primary", disabled=not can_create)
+    if create:
+        create_new_clips()
+        st.rerun()
+
+    if session_state.clips:
+        st.subheader("Dernière vidéo")
+        for clip in session_state.clips:
+            try:
+                display_video(clip)
+            except st.errors.StreamlitDuplicateElementKey:
+                st.text(DUPLICATE_VIDEO_DOWNLOAD_KEY)
+        if len(session_state.clips) > 1 and session_state.zipped_clips_s3_url:
+            link_col, qrcode_col = st.columns(2)
+            with link_col:
+                st.markdown(f"[link to all videos]({session_state.zipped_clips_s3_url})")
+            with qrcode_col:
+                st.image(generate_qr_code(session_state.zipped_clips_s3_url), caption="Scannez pour tout récupérer (zip)")
+        if nb_all:
+            st.info("Pour le groupe suivant : appuyez sur « Nouvelle série » (les photos de ce groupe sont vidées).")
+            st.button("Nouvelle série (Reset Photos)", on_click=new_series)
+
+    display_history()
+
+
+def display_history():
+    """Videos precedentes de la soiree (la plus recente en haut), avec vignette, lien et QR code."""
+    older = session_state.history[1:]
+    if not older:
+        return
+    st.subheader("Historique de la soirée")
+    for entry in older:
+        thumb_col, text_col, qr_col = st.columns([1, 2, 1])
+        with thumb_col:
+            if entry.get("thumb") and os.path.exists(entry["thumb"]):
+                st.image(entry["thumb"], width=120)
+        with text_col:
+            st.markdown(f"**{entry['label']}**  \n{entry['time']}")
+            for clip in entry["clips"]:
+                st.markdown(f"[lien]({clip['s3_url']})")
+        with qr_col:
+            for clip in entry["clips"]:
+                st.image(generate_qr_code(clip["s3_url"]), width=120)
+
+
+def make_video_stem(event: str, serie_number: int, audio_name: str, multiple_tracks: bool) -> str:
+    """Nom du fichier video (sans extension) : nom de l'evenement (ou du son) + numero de video."""
+    base = event or audio_name
+    stem = f"{base}_{serie_number:03d}"
+    if event and multiple_tracks:
+        stem += f"_{audio_name}"
+    return stem
+
 
 def create_new_clips():
+    # On ne garde pas les anciens fichiers video sur le disque : l'historique garde les liens.
     for clip in session_state.clips:
-        os.remove(clip["path"])
+        try:
+            os.remove(clip["path"])
+        except OSError:
+            pass
     session_state.clips = []
-    datetime_str = datetime.now(ZoneInfo("Europe/Paris")).strftime("%d-%m-%Y:%H-%M-%S")
+    now = datetime.now(ZoneInfo("Europe/Paris"))
+    datetime_str = now.strftime("%d-%m-%Y:%H-%M-%S")
+    session_state.video_counter += 1
+    n = session_state.video_counter
+    event = clean_file_name(session_state.event_name, max_length=40) if session_state.event_name.strip() else ""
+    key_dir = join(event, datetime_str) if event else datetime_str
+    selected = selected_paths()
+    session_state.selected_image_paths = selected
+    multiple_tracks = len(session_state.audio_tracks) > 1
     for track in session_state.audio_tracks:
+        audio_name = clean_file_name(splitext(track["file"].name)[0])
+        stem = make_video_stem(event, n, audio_name, multiple_tracks)
         clip_path, duration = create_clip(
             track,
-            session_state.selected_image_paths,
+            selected,
+            file_stem=stem,
             mute=session_state.mute_video,
             filter_name=session_state.filter_name,
             keep_colors=session_state.keep_colors,
@@ -318,15 +511,29 @@ def create_new_clips():
             temperature=session_state.temperature,
             tint=session_state.tint,
         )
-        s3_url = upload_file_to_bucket(clip_path, join(datetime_str, clip_path))
+        s3_url = upload_file_to_bucket(clip_path, join(key_dir, clip_path))
         session_state.clips.append({
             "path": clip_path,
             "s3_url": s3_url,
             "duration": duration
         })
     zipped_clips_path = zip_all_clips(datetime_str)
-    zipped_clips_s3_url = upload_file_to_bucket(zipped_clips_path, datetime_str + ".zip")
+    zipped_clips_s3_url = upload_file_to_bucket(zipped_clips_path, key_dir + ".zip")
     session_state.zipped_clips_s3_url = zipped_clips_s3_url
+    # Historique : vignette (1re photo cochee, avec reglages et filtre) + liens
+    thumb_path = os.path.join(session_state.tempdir.name, f"history_{n}.jpg")
+    try:
+        preview_image(selected[0], width=240).save(thumb_path, quality=85)
+    except Exception:
+        thumb_path = None
+    session_state.history.insert(0, {
+        "label": event or clean_file_name(splitext(session_state.audio_tracks[0]["file"].name)[0]),
+        "time": now.strftime("%H:%M:%S"),
+        "thumb": thumb_path,
+        "clips": [dict(c) for c in session_state.clips],
+        "number": n,
+    })
+
 
 def clean_file_name(name: str, max_length: int = 60) -> str:
     """
@@ -338,9 +545,11 @@ def clean_file_name(name: str, max_length: int = 60) -> str:
     name = re.sub(r"_+", "_", name).strip("_-")
     return (name[:max_length].strip("_-")) or "video"
 
+
 def create_clip(
     track: defaultdict,
     image_paths: list,
+    file_stem: str | None = None,
     mute: bool = False,
     filter_name: str = video_editing.FILTER_NONE,
     keep_colors=None,
@@ -354,15 +563,18 @@ def create_clip(
     ### Description:
     Wrapper around video_editing.create_clip to prepare its inputs.
     ### Returns:
-    Returns the path to the clip file and its duration. 
+    Returns the path to the clip file and its duration.
     """
     audio_name, audio_ext = splitext(track["file"].name)
     audio_name = clean_file_name(audio_name)
-    # to str in case splitext returns None
-    video_filename = VIDEO_NAME_FORMAT.format(
-        audio_name=audio_name,
-        bpm=track["bpm"],
-    )
+    if file_stem:
+        video_filename = f"{file_stem}.mp4"
+    else:
+        # to str in case splitext returns None
+        video_filename = VIDEO_NAME_FORMAT.format(
+            audio_name=audio_name,
+            bpm=track["bpm"],
+        )
     # For some reason, I couldn't access the file provided by the fileuploader.
     # So create a temp file as aid band fix (yet another one).
     with tempfile.NamedTemporaryFile(suffix=audio_ext) as audio_file:
@@ -384,6 +596,7 @@ def create_clip(
         )
         return video_filename, track["duration"]
 
+
 def zip_all_clips(zip_filename: str) -> str:
     zip_path = os.path.join(session_state.tempdir.name, zip_filename) + ".zip"
     with zipfile.ZipFile(zip_path, "w") as zipf:
@@ -391,6 +604,7 @@ def zip_all_clips(zip_filename: str) -> str:
             arcname = os.path.basename(clip["path"])  # Name inside zip
             zipf.write(clip["path"], arcname=arcname)
     return zip_path
+
 
 def display_video(clip: dict):
     with open(clip["path"], "rb") as video_file:
@@ -409,7 +623,7 @@ def display_video(clip: dict):
             st.markdown(f"[link]({clip['s3_url']})")
         with qrcode_col:
             qr_img = generate_qr_code(clip["s3_url"])
-            st.image(qr_img, caption="Scan to download zip file")
+            st.image(qr_img, caption="Scannez pour récupérer la vidéo")
 
 
 def generate_qr_code(url: str) -> BytesIO:
