@@ -43,10 +43,13 @@ DEFAULT_BUTTON_POSITION = "Bas gauche"
 
 
 def main():
+    st.set_page_config(page_title="Kaléidoscope", layout="wide")
     if "tempdir" not in session_state:
         setup_session_state()
     ensure_state()
-    st.title("Video Clip Creator")
+    camera_big = session_state.get("fullscreen_cam", True)
+    if not (camera_big and session_state.get("mode", MODE_PHOTO) == MODE_PHOTO):
+        st.title("Video Clip Creator")
     settings_section()
     mode = st.radio(
         "Mode",
@@ -198,7 +201,12 @@ def settings_section():
         # Option : couper le son de la video (le rythme et la duree restent cales sur l'audio)
         session_state.mute_video = st.checkbox("Couper le son de la vidéo", value=False, key="mute_checkbox")
 
-        st.markdown("**Bouton photo**")
+        st.markdown("**Caméra et bouton photo**")
+        st.checkbox(
+            "Caméra en grand (carré plein écran, sans bandes grises)",
+            value=True,
+            key="fullscreen_cam",
+        )
         st.selectbox(
             "Position du gros bouton de prise de photo",
             list(BUTTON_POSITIONS),
@@ -305,31 +313,53 @@ def next_photo_path(prefix: str) -> str:
     return os.path.join(session_state.tempdir.name, f"{prefix}_{session_state.photo_counter}.jpg")
 
 
+BIG_CAMERA_CSS = """
+<style>
+:root { --cam-side: min(calc(100vw - 2.5rem), calc(100vh - 250px));
+        --cam-side: min(calc(100vw - 2.5rem), calc(100dvh - 250px)); }
+div[data-testid="stMainBlockContainer"] { padding-top: 3.2rem; }
+div[data-testid="stCameraInput"] { width: var(--cam-side); margin: 0 auto; }
+div[data-testid="stCameraInputWebcamComponent"] { width: 100%; }
+div[data-testid="stCameraInputWebcamStyledBox"] {
+    width: 100% !important; height: var(--cam-side) !important; aspect-ratio: 1 / 1;
+}
+div[data-testid="stCameraInputWebcamStyledBox"] video {
+    width: 100% !important; height: 100% !important; object-fit: cover;
+}
+</style>
+"""
+
+
 def picture_from_camera():
-    # Repere carre : bandeaux gris haut/bas a 22% (cale au metre sur iPad portrait).
-    st.markdown(
-        """
-        <style>
-        div[data-testid="stCameraInput"] > div { position: relative; }
-        div[data-testid="stCameraInput"] > div::after {
-            content: "";
-            position: absolute;
-            top: 0; left: 0; right: 0; bottom: 0;
-            pointer-events: none;
-            z-index: 10;
-            background:
-                linear-gradient(to bottom,
-                    rgba(0,0,0,0.45) 0%,
-                    rgba(0,0,0,0.45) 24%,
-                    rgba(0,0,0,0) 24%,
-                    rgba(0,0,0,0) 76%,
-                    rgba(0,0,0,0.45) 76%,
-                    rgba(0,0,0,0.45) 100%);
-        }
-        </style>
-        """,
-        unsafe_allow_html=True,
-    )
+    big = session_state.get("fullscreen_cam", True)
+    if big:
+        # Seul le carre qui sera filme est affiche (centre du flux), aussi grand que possible.
+        st.markdown(BIG_CAMERA_CSS, unsafe_allow_html=True)
+    # Ancien affichage : repere carre par bandeaux gris haut/bas (cale sur iPad portrait).
+    if not big:
+        st.markdown(
+            """
+            <style>
+            div[data-testid="stCameraInput"] > div { position: relative; }
+            div[data-testid="stCameraInput"] > div::after {
+                content: "";
+                position: absolute;
+                top: 0; left: 0; right: 0; bottom: 0;
+                pointer-events: none;
+                z-index: 10;
+                background:
+                    linear-gradient(to bottom,
+                        rgba(0,0,0,0.45) 0%,
+                        rgba(0,0,0,0.45) 24%,
+                        rgba(0,0,0,0) 24%,
+                        rgba(0,0,0,0) 76%,
+                        rgba(0,0,0,0.45) 76%,
+                        rgba(0,0,0,0.45) 100%);
+            }
+            </style>
+            """,
+            unsafe_allow_html=True,
+        )
     # Gros bouton rond de prise de photo, fixe a l'ecran, a l'endroit choisi dans les reglages.
     position_css = BUTTON_POSITIONS.get(session_state.get("btn_pos"), BUTTON_POSITIONS[DEFAULT_BUTTON_POSITION])
     st.markdown(
@@ -359,7 +389,11 @@ def picture_from_camera():
     if session_state.get("photo_added"):
         session_state.photo_added = False
         st.toast(f"Photo {len(session_state.image_paths)} enregistrée ✓")
-    picture = st.camera_input("Take a photo", key=f"camera_{session_state.camera_key}")
+    picture = st.camera_input(
+        "Take a photo",
+        key=f"camera_{session_state.camera_key}",
+        label_visibility="collapsed" if big else "visible",
+    )
     if picture is not None:
         data = picture.getvalue()
         if is_valid_image(data):
@@ -677,4 +711,5 @@ def generate_qr_code(url: str) -> BytesIO:
 
 
 if __name__ == "__main__":
+    main()
     main()
