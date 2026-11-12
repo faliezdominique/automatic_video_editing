@@ -6,7 +6,7 @@ from shutil import copytree
 from tempfile import mkdtemp
 
 import numpy as np
-from PIL import ImageFilter
+from PIL import ImageFilter, ImageEnhance
 
 from moviepy.video.fx import Rotate, Crop
 from moviepy import Clip, ImageSequenceClip, AudioFileClip, clips_array
@@ -33,6 +33,12 @@ COLOR_HUES = {
 }
 DEFAULT_KEEP_COLORS = ["Rouge", "Jaune", "Bleu"]
 DEFAULT_SAT_MIN = 0.40
+# Luminosite / contraste en pourcentage : 0 = inchange, -50 = plus sombre / moins contraste, +50 = inverse
+DEFAULT_BRIGHTNESS = 0
+DEFAULT_CONTRAST = 0
+# Balance des couleurs : temperature (- froid/bleute, + chaud/orange) et teinte (- vert, + magenta), 0 = inchange
+DEFAULT_TEMPERATURE = 0
+DEFAULT_TINT = 0
 
 
 def _hue_in_range(hue_deg, start, end):
@@ -41,9 +47,46 @@ def _hue_in_range(hue_deg, start, end):
     return (hue_deg >= start) | (hue_deg <= end)
 
 
-def apply_filter(img, filter_name=FILTER_NONE, keep_colors=None, sat_min=DEFAULT_SAT_MIN):
-    """Retourne une copie filtree de l'image PIL (RGB). Ne modifie pas l'original."""
+def adjust_image(
+    img,
+    brightness=DEFAULT_BRIGHTNESS,
+    contrast=DEFAULT_CONTRAST,
+    temperature=DEFAULT_TEMPERATURE,
+    tint=DEFAULT_TINT,
+):
+    """
+    Retourne une copie reglee : balance des couleurs, puis luminosite, puis contraste.
+    Tous les reglages sont en % (0 = inchange). Ne modifie pas l'original.
+    """
     img = img.convert("RGB")
+    if temperature or tint:
+        # Gains par canal : +/-20 % au maximum (reglage +/-50)
+        gains = np.array([
+            1 + temperature / 250.0,   # rouge : monte quand on rechauffe
+            1 - tint / 250.0,          # vert : baisse quand on va vers le magenta
+            1 - temperature / 250.0,   # bleu : baisse quand on rechauffe
+        ])
+        a = np.array(img).astype(float) * gains
+        img = Image.fromarray(a.clip(0, 255).astype("uint8"))
+    if brightness:
+        img = ImageEnhance.Brightness(img).enhance(max(0.0, 1 + brightness / 100.0))
+    if contrast:
+        img = ImageEnhance.Contrast(img).enhance(max(0.0, 1 + contrast / 100.0))
+    return img
+
+
+def apply_filter(
+    img,
+    filter_name=FILTER_NONE,
+    keep_colors=None,
+    sat_min=DEFAULT_SAT_MIN,
+    brightness=DEFAULT_BRIGHTNESS,
+    contrast=DEFAULT_CONTRAST,
+    temperature=DEFAULT_TEMPERATURE,
+    tint=DEFAULT_TINT,
+):
+    """Retourne une copie reglee puis filtree de l'image PIL (RGB). Ne modifie pas l'original."""
+    img = adjust_image(img, brightness, contrast, temperature, tint)
     if filter_name == FILTER_BW:
         return img.convert("L").convert("RGB")
     if filter_name == FILTER_SEPIA:
@@ -75,15 +118,30 @@ def apply_filter(img, filter_name=FILTER_NONE, keep_colors=None, sat_min=DEFAULT
     return img
 
 
-def apply_filter_to_files(image_paths, filter_name, keep_colors, sat_min):
-    """Cree des COPIES filtrees dans un dossier temporaire et renvoie leurs chemins."""
-    if filter_name == FILTER_NONE:
+def apply_filter_to_files(
+    image_paths,
+    filter_name,
+    keep_colors,
+    sat_min,
+    brightness=DEFAULT_BRIGHTNESS,
+    contrast=DEFAULT_CONTRAST,
+    temperature=DEFAULT_TEMPERATURE,
+    tint=DEFAULT_TINT,
+):
+    """Cree des COPIES reglees/filtrees dans un dossier temporaire et renvoie leurs chemins."""
+    if (
+        filter_name == FILTER_NONE
+        and not brightness and not contrast
+        and not temperature and not tint
+    ):
         return image_paths
     out_dir = mkdtemp()
     filtered = []
     for i, path in enumerate(image_paths):
         with Image.open(path) as im:
-            res = apply_filter(im, filter_name, keep_colors, sat_min)
+            res = apply_filter(
+                im, filter_name, keep_colors, sat_min, brightness, contrast, temperature, tint
+            )
         fp = join(out_dir, f"filtered_{i}.jpg")
         res.save(fp, quality=95)
         filtered.append(fp)
@@ -100,10 +158,16 @@ def create_clip(
     filter_name: str = FILTER_NONE,
     keep_colors=None,
     sat_min: float = DEFAULT_SAT_MIN,
+    brightness: int = DEFAULT_BRIGHTNESS,
+    contrast: int = DEFAULT_CONTRAST,
+    temperature: int = DEFAULT_TEMPERATURE,
+    tint: int = DEFAULT_TINT,
 ):
     center_crop_to_square(image_paths)
-    # Filtre applique sur des copies (les photos d'origine restent intactes)
-    image_paths = apply_filter_to_files(image_paths, filter_name, keep_colors, sat_min)
+    # Reglages et filtre appliques sur des copies (les photos d'origine restent intactes)
+    image_paths = apply_filter_to_files(
+        image_paths, filter_name, keep_colors, sat_min, brightness, contrast, temperature, tint
+    )
     # Load audio
     audio = AudioFileClip(audio_path).with_duration(duration)
     fps = bpm / 60
