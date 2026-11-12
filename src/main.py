@@ -1,5 +1,7 @@
 import os
+import re
 import PIL
+import unicodedata
 from PIL import Image
 import base64
 import zipfile
@@ -66,8 +68,30 @@ def main():
         st.warning("Veuillez cocher au moins une photo.")
         return
 
-    # Filtre applique aux photos (sur des copies : les photos d'origine ne sont pas modifiees)
-    st.subheader("Filtre")
+    # Reglages et filtre appliques a toutes les photos (sur des copies : les originaux ne sont pas modifies)
+    st.subheader("Réglages et filtre")
+    bright_col, contrast_col = st.columns(2)
+    with bright_col:
+        session_state.brightness = st.slider(
+            "Luminosité", min_value=-50, max_value=50, value=video_editing.DEFAULT_BRIGHTNESS,
+            step=5, key="brightness_slider",
+        )
+    with contrast_col:
+        session_state.contrast = st.slider(
+            "Contraste", min_value=-50, max_value=50, value=video_editing.DEFAULT_CONTRAST,
+            step=5, key="contrast_slider",
+        )
+    temp_col, tint_col = st.columns(2)
+    with temp_col:
+        session_state.temperature = st.slider(
+            "Température (− froid / + chaud)", min_value=-50, max_value=50,
+            value=video_editing.DEFAULT_TEMPERATURE, step=5, key="temperature_slider",
+        )
+    with tint_col:
+        session_state.tint = st.slider(
+            "Teinte (− vert / + magenta)", min_value=-50, max_value=50,
+            value=video_editing.DEFAULT_TINT, step=5, key="tint_slider",
+        )
     session_state.filter_name = st.selectbox("Filtre", video_editing.FILTER_NAMES, key="filter_select")
     if session_state.filter_name == video_editing.FILTER_BW_COLORS:
         st.caption("Couleurs à conserver (le reste passe en noir et blanc) :")
@@ -91,14 +115,22 @@ def main():
     else:
         session_state.keep_colors = []
         session_state.sat_min = video_editing.DEFAULT_SAT_MIN
-    if session_state.filter_name != video_editing.FILTER_NONE:
+    if (
+        session_state.filter_name != video_editing.FILTER_NONE
+        or session_state.brightness != 0
+        or session_state.contrast != 0
+        or session_state.temperature != 0
+        or session_state.tint != 0
+    ):
         with Image.open(selected_paths[0]) as im:
             small = im.convert("RGB")
             small.thumbnail((600, 600))
         preview = video_editing.apply_filter(
-            small, session_state.filter_name, session_state.keep_colors, session_state.sat_min
+            small, session_state.filter_name, session_state.keep_colors, session_state.sat_min,
+            session_state.brightness, session_state.contrast,
+            session_state.temperature, session_state.tint,
         )
-        st.image(preview, caption="Aperçu du filtre (1re photo sélectionnée)", width=260)
+        st.image(preview, caption="Aperçu des réglages (1re photo sélectionnée)", width=260)
 
     # Option : couper le son de la video (le rythme et la duree restent cales sur l'audio)
     session_state.mute_video = st.checkbox("Couper le son de la vidéo", value=False)
@@ -132,7 +164,12 @@ def setup_session_state():
     session_state.filter_name = video_editing.FILTER_NONE
     session_state.keep_colors = []
     session_state.sat_min = video_editing.DEFAULT_SAT_MIN
-    session_state.prev_picture = None
+    session_state.brightness = video_editing.DEFAULT_BRIGHTNESS
+    session_state.contrast = video_editing.DEFAULT_CONTRAST
+    session_state.temperature = video_editing.DEFAULT_TEMPERATURE
+    session_state.tint = video_editing.DEFAULT_TINT
+    session_state.camera_key = 0
+    session_state.photo_added = False
     session_state.session_key = 0
     # list of dicts containing "file", "bpm" and "duration" keys/values
     session_state.audio_tracks = [mk_track_dict()]
@@ -199,17 +236,24 @@ def picture_from_camera():
         """,
         unsafe_allow_html=True,
     )
-    picture = st.camera_input("Take a photo")
-    # Band aid fix: 
-    # In case the clear photo button was not pressed the st.camera_input will return the last picture taken.
-    # This would erroneously add the same picture to the image paths.
-    if picture is not None and session_state.prev_picture != picture:
-        session_state.prev_picture = picture 
+    # Retour rapide a la video : apres chaque photo, on change la cle du widget camera,
+    # ce qui l'affiche de nouveau en direct (plus besoin de "Clear photo").
+    # Les photos prises restent en dessous, decochables si elles ne conviennent pas.
+    if "camera_key" not in session_state:
+        session_state.camera_key = 0
+    if session_state.get("photo_added"):
+        session_state.photo_added = False
+        st.toast(f"Photo {len(session_state.image_paths)} enregistrée ✓")
+    picture = st.camera_input("Take a photo", key=f"camera_{session_state.camera_key}")
+    if picture is not None:
         img_idx = len(session_state.image_paths)
         image_path = os.path.join(session_state.tempdir.name, f"photo_{img_idx}.jpg")
         with open(image_path, "wb") as f:
             f.write(picture.getbuffer())
         session_state.image_paths.append(image_path)
+        session_state.camera_key += 1
+        session_state.photo_added = True
+        st.rerun()
 
 def images_uploader():
     # Add image uploader to upload multiple images
@@ -269,6 +313,10 @@ def create_new_clips():
             filter_name=session_state.filter_name,
             keep_colors=session_state.keep_colors,
             sat_min=session_state.sat_min,
+            brightness=session_state.brightness,
+            contrast=session_state.contrast,
+            temperature=session_state.temperature,
+            tint=session_state.tint,
         )
         s3_url = upload_file_to_bucket(clip_path, join(datetime_str, clip_path))
         session_state.clips.append({
@@ -280,6 +328,16 @@ def create_new_clips():
     zipped_clips_s3_url = upload_file_to_bucket(zipped_clips_path, datetime_str + ".zip")
     session_state.zipped_clips_s3_url = zipped_clips_s3_url
 
+def clean_file_name(name: str, max_length: int = 60) -> str:
+    """
+    Rend un nom de fichier sur : sans accents, guillemets, espaces ni symboles.
+    Garde seulement lettres, chiffres, tiret et underscore (evite les liens/QR codes casses).
+    """
+    name = unicodedata.normalize("NFKD", str(name)).encode("ascii", "ignore").decode("ascii")
+    name = re.sub(r"[^A-Za-z0-9_-]+", "_", name)
+    name = re.sub(r"_+", "_", name).strip("_-")
+    return (name[:max_length].strip("_-")) or "video"
+
 def create_clip(
     track: defaultdict,
     image_paths: list,
@@ -287,6 +345,10 @@ def create_clip(
     filter_name: str = video_editing.FILTER_NONE,
     keep_colors=None,
     sat_min: float = video_editing.DEFAULT_SAT_MIN,
+    brightness: int = video_editing.DEFAULT_BRIGHTNESS,
+    contrast: int = video_editing.DEFAULT_CONTRAST,
+    temperature: int = video_editing.DEFAULT_TEMPERATURE,
+    tint: int = video_editing.DEFAULT_TINT,
 ) -> tuple[str, float]:
     """
     ### Description:
@@ -295,7 +357,7 @@ def create_clip(
     Returns the path to the clip file and its duration. 
     """
     audio_name, audio_ext = splitext(track["file"].name)
-    audio_name = str(audio_name).replace(" ", "_")
+    audio_name = clean_file_name(audio_name)
     # to str in case splitext returns None
     video_filename = VIDEO_NAME_FORMAT.format(
         audio_name=audio_name,
@@ -315,6 +377,10 @@ def create_clip(
             filter_name=filter_name,
             keep_colors=keep_colors,
             sat_min=sat_min,
+            brightness=brightness,
+            contrast=contrast,
+            temperature=temperature,
+            tint=tint,
         )
         return video_filename, track["duration"]
 
