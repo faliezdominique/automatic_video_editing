@@ -43,7 +43,11 @@ DEFAULT_BUTTON_POSITION = "Bas gauche"
 
 
 def main():
-    st.set_page_config(page_title="Kaléidoscope", layout="wide")
+    try:
+        st.set_page_config(page_title="Kaléidoscope", layout="wide")
+    except Exception:
+        # Deja fait pendant cette session : sans importance, la page reste en pleine largeur
+        pass
     if "tempdir" not in session_state:
         setup_session_state()
     ensure_state()
@@ -146,10 +150,8 @@ def settings_section():
         )
 
         st.markdown("**Son**")
-        if st.button(r"\+ audio track"):
-            session_state.audio_tracks.append(mk_track_dict())
-        for track_idx, track in enumerate(session_state.audio_tracks):
-            create_audio_track_inputs(track_idx, track)
+        # Une seule musique par evenement
+        create_audio_track_inputs(0, session_state.audio_tracks[0])
 
         st.markdown("**Image**")
         bright_col, contrast_col = st.columns(2)
@@ -252,18 +254,19 @@ def create_audio_track_inputs(track_idx: int, track: defaultdict):
     cols = st.columns(spec)
     with cols[0]:
         track["file"] = st.file_uploader(
-            "Audio File",
+            "Fichier audio (la musique de l'événement)",
+            type=["mp3", "wav", "m4a", "aac", "ogg", "flac"],
             key=track_idx * NB_KEYS_PER_AUDIO_TRACK,
         )
     with cols[1]:
         track["bpm"] = st.number_input(
-            "BPM",
+            "BPM (rythme)",
             min_value=1.0,
             value=DEFAULT_BPM,
             key=track_idx * NB_KEYS_PER_AUDIO_TRACK + 1)
     with cols[2]:
         track["duration"] = st.number_input(
-            "Duration (s)",
+            "Durée (s)",
             min_value=1.0,
             value=DEFAULT_DURATION,
             key=track_idx * NB_KEYS_PER_AUDIO_TRACK + 2
@@ -711,5 +714,4 @@ def generate_qr_code(url: str) -> BytesIO:
 
 
 if __name__ == "__main__":
-    main()
     main()
