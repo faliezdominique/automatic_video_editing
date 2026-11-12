@@ -111,9 +111,24 @@ def mk_track_dict() -> defaultdict:
         )
 
 
+def is_valid_image(data: bytes) -> bool:
+    """Vrai si les octets forment une image lisible (evite les photos vides ou tronquees)."""
+    if not data:
+        return False
+    try:
+        with Image.open(BytesIO(data)) as im:
+            im.load()
+        return True
+    except Exception:
+        return False
+
+
 def selected_paths() -> list:
     """Photos cochees (toutes par defaut). La selection est gardee dans l'etat de la session."""
-    return [p for p in session_state.image_paths if p not in session_state.unchecked]
+    return [
+        p for p in session_state.image_paths
+        if p not in session_state.unchecked and os.path.exists(p) and os.path.getsize(p) > 0
+    ]
 
 
 # ---------------------------------------------------------------------------
@@ -338,17 +353,25 @@ def picture_from_camera():
     # Retour rapide a la video : apres chaque photo, on change la cle du widget camera,
     # ce qui l'affiche de nouveau en direct (plus besoin de "Clear photo").
     # Les photos prises restent en dessous, decochables si elles ne conviennent pas.
+    if session_state.get("photo_failed"):
+        session_state.photo_failed = False
+        st.toast("⚠️ Photo non enregistrée (caméra pas encore prête). Refaites-la.")
     if session_state.get("photo_added"):
         session_state.photo_added = False
         st.toast(f"Photo {len(session_state.image_paths)} enregistrée ✓")
     picture = st.camera_input("Take a photo", key=f"camera_{session_state.camera_key}")
     if picture is not None:
-        image_path = next_photo_path("photo")
-        with open(image_path, "wb") as f:
-            f.write(picture.getbuffer())
-        session_state.image_paths.append(image_path)
+        data = picture.getvalue()
+        if is_valid_image(data):
+            image_path = next_photo_path("photo")
+            with open(image_path, "wb") as f:
+                f.write(data)
+            session_state.image_paths.append(image_path)
+            session_state.photo_added = True
+        else:
+            # Image vide ou illisible : on l'ignore, sans bloquer l'application
+            session_state.photo_failed = True
         session_state.camera_key += 1
-        session_state.photo_added = True
         st.rerun()
 
 
@@ -361,11 +384,18 @@ def images_uploader():
         label_visibility="visible",
     )
     if uploaded_images:
+        refused = 0
         for uploaded_img in uploaded_images:
+            data = uploaded_img.getvalue()
+            if not is_valid_image(data):
+                refused += 1
+                continue
             image_path = next_photo_path("uploaded")
             with open(image_path, "wb") as f:
-                f.write(uploaded_img.getbuffer())
+                f.write(data)
             session_state.image_paths.append(image_path)
+        if refused:
+            session_state.photo_failed = True
         session_state.session_key += 1
         st.rerun()
 
@@ -395,12 +425,21 @@ def display_image_selector(image_paths):
     cols = st.columns(4)
     for idx, path in enumerate(image_paths):
         with cols[idx % 4]:
-            st.image(path, width=140)
+            readable = True
+            try:
+                st.image(path, width=140)
+            except Exception:
+                readable = False
+                st.warning("Photo illisible (ignorée)")
+                session_state.unchecked.add(path)
             checked = st.checkbox(
                 "Inclure",
-                value=path not in session_state.unchecked,
+                value=readable and path not in session_state.unchecked,
+                disabled=not readable,
                 key=f"select_img_{session_state.series_key}_{idx}",
             )
+            if not readable:
+                continue
             if checked:
                 session_state.unchecked.discard(path)
             else:
