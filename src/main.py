@@ -72,6 +72,7 @@ def setup_session_state():
     session_state.image_paths = []
     session_state.selected_image_paths = []
     session_state.mute_video = False
+    session_state.auto_enhance_on = True
     session_state.filter_name = video_editing.FILTER_NONE
     session_state.keep_colors = []
     session_state.sat_min = video_editing.DEFAULT_SAT_MIN
@@ -151,6 +152,11 @@ def settings_section():
         create_audio_track_inputs(0, session_state.audio_tracks[0])
 
         st.markdown("**Image**")
+        session_state.auto_enhance_on = st.checkbox(
+            "✨ Amélioration automatique (recommandé) : exposition, netteté, bruit, couleurs",
+            value=True,
+            key="auto_enhance_cb",
+        )
         bright_col, contrast_col = st.columns(2)
         with bright_col:
             session_state.brightness = st.slider(
@@ -197,6 +203,32 @@ def settings_section():
             session_state.keep_colors = []
             session_state.sat_min = video_editing.DEFAULT_SAT_MIN
 
+        # Poste de reglage : on choisit une photo de reference, on regle, et c'est applique a toute la serie
+        st.markdown("**Aperçu des réglages** (appliqués à toutes les photos cochées)")
+        paths = selected_paths()
+        if paths:
+            ref_idx = 0
+            if len(paths) > 1:
+                ref_idx = st.selectbox(
+                    "Photo de référence",
+                    list(range(len(paths))),
+                    format_func=lambda i: f"Photo {i + 1} sur {len(paths)}",
+                    key="ref_photo_idx",
+                )
+            ref_idx = min(ref_idx, len(paths) - 1)
+            params = video_editing.enhance_params(paths) if session_state.auto_enhance_on else None
+            before_col, after_col = st.columns(2)
+            with before_col:
+                st.image(square_thumb(paths[ref_idx], 700), caption="Avant", use_container_width=True)
+            with after_col:
+                try:
+                    after = preview_image(paths[ref_idx], width=700, enhance=params)
+                    st.image(after, caption="Après", use_container_width=True)
+                except Exception:
+                    st.caption("Aperçu indisponible pour cette photo.")
+        else:
+            st.caption("Prenez une photo pour voir l'aperçu des réglages.")
+
         # Option : couper le son de la video (le rythme et la duree restent cales sur l'audio)
         session_state.mute_video = st.checkbox("Couper le son de la vidéo", value=False, key="mute_checkbox")
 
@@ -213,6 +245,18 @@ def settings_section():
             key="cam_facing",
             on_change=restart_camera,
         )
+        zoom_off = not session_state.get("fullscreen_cam", True)
+        st.slider(
+            "Zoom caméra avant (selfie) — ×1 = image complète. Réduit le fond et la déformation "
+            "des bords, mais la photo est moins nette.",
+            min_value=1.0, max_value=2.0, value=1.0, step=0.1,
+            key="cam_zoom_front", disabled=zoom_off,
+        )
+        st.slider(
+            "Zoom caméra arrière",
+            min_value=1.0, max_value=2.0, value=1.0, step=0.1,
+            key="cam_zoom_rear", disabled=zoom_off,
+        )
         st.selectbox(
             "Position du gros bouton de prise de photo",
             list(BUTTON_POSITIONS),
@@ -220,26 +264,16 @@ def settings_section():
             key="btn_pos",
         )
 
-        # Apercu des reglages sur la premiere photo cochee
-        paths = selected_paths()
-        adjusted = (
-            session_state.filter_name != video_editing.FILTER_NONE
-            or session_state.brightness != 0
-            or session_state.contrast != 0
-            or session_state.temperature != 0
-            or session_state.tint != 0
-        )
-        if paths and adjusted:
-            preview = preview_image(paths[0], width=600)
-            st.image(preview, caption="Aperçu des réglages (1re photo cochée)", width=260)
-        elif not paths:
-            st.caption("Prenez une photo pour voir l'aperçu des réglages.")
 
 
-def preview_image(path: str, width: int = 600):
+def preview_image(path: str, width: int = 600, enhance=None):
     """Retourne une petite version de la photo avec les reglages et le filtre courants."""
     with Image.open(path) as im:
         small = im.convert("RGB")
+        w, h = small.size
+        side = min(w, h)
+        left, top = (w - side) // 2, (h - side) // 2
+        small = small.crop((left, top, left + side, top + side))  # carre : comme dans la video
         small.thumbnail((width, width))
     return video_editing.apply_filter(
         small,
@@ -250,18 +284,147 @@ def preview_image(path: str, width: int = 600):
         session_state.contrast,
         session_state.temperature,
         session_state.tint,
+        enhance=enhance,
     )
+
+
+# Musiques de l'evenement : rangees dans le bucket Scaleway (dossier "musiques/"), donc conservees
+# d'une soiree a l'autre. Si Scaleway est injoignable ou la liste vide : envoi d'un fichier comme avant.
+MUSIC_PREFIX = "musiques/"
+MUSIC_EXTENSIONS = (".mp3", ".wav", ".m4a", ".aac", ".ogg", ".flac")
+AUDIO_MIME = {
+    ".mp3": "audio/mpeg", ".wav": "audio/wav", ".m4a": "audio/mp4",
+    ".aac": "audio/aac", ".ogg": "audio/ogg", ".flac": "audio/flac",
+}
+
+
+@st.cache_resource
+def music_client():
+    """Client Scaleway a delais courts (la liste des musiques ne doit jamais bloquer l'application)."""
+    import boto3
+    from botocore.config import Config
+
+    region = st.secrets["REGION"]
+    return boto3.client(
+        "s3",
+        region_name=region,
+        endpoint_url=os.environ.get("KALEIDO_S3_ENDPOINT") or f"https://s3.{region}.scw.cloud",
+        aws_access_key_id=st.secrets["SCW_ACCESS_KEY"],
+        aws_secret_access_key=st.secrets["SCW_SECRET_KEY"],
+        config=Config(connect_timeout=5, read_timeout=20, retries={"max_attempts": 2}),
+    )
+
+
+def fetch_music_list():
+    """{nom affiche: cle} des musiques du bucket (triees), ou None si Scaleway est injoignable."""
+    try:
+        client, bucket = music_client(), st.secrets["BUCKET_NAME"]
+        found = {}
+        for page in client.get_paginator("list_objects_v2").paginate(Bucket=bucket, Prefix=MUSIC_PREFIX):
+            for obj in page.get("Contents", []):
+                name = obj["Key"][len(MUSIC_PREFIX):]
+                if name and name.lower().endswith(MUSIC_EXTENSIONS):
+                    found[splitext(name)[0]] = obj["Key"]
+        return dict(sorted(found.items()))
+    except Exception:
+        return None
+
+
+def ensure_music_list(force: bool = False):
+    if force or "music_list" not in session_state:
+        session_state.music_list = fetch_music_list()
+
+
+@st.cache_data(show_spinner=False, max_entries=30)
+def download_music(key: str) -> bytes:
+    return music_client().get_object(Bucket=st.secrets["BUCKET_NAME"], Key=key)["Body"].read()
+
+
+def save_music_files(files) -> int:
+    """Envoie les fichiers audio dans le bucket. Retourne le nombre de fichiers enregistres."""
+    client, bucket = music_client(), st.secrets["BUCKET_NAME"]
+    saved = 0
+    for f in files:
+        base, ext = splitext(f.name)
+        ext = ext.lower()
+        if ext not in MUSIC_EXTENSIONS:
+            continue
+        client.put_object(
+            Bucket=bucket,
+            Key=f"{MUSIC_PREFIX}{clean_file_name(base)}{ext}",
+            Body=f.getvalue(),
+            ContentType=AUDIO_MIME.get(ext, "application/octet-stream"),
+        )
+        saved += 1
+    download_music.clear()
+    return saved
+
+
+class S3Audio:
+    """Musique du bucket, utilisable comme un fichier envoye (memes .name et .getbuffer())."""
+
+    def __init__(self, key: str):
+        self.key = key
+        self.name = os.path.basename(key)
+
+    def getbuffer(self) -> bytes:
+        return download_music(self.key)
+
+
+def music_chooser(track: defaultdict, track_idx: int):
+    """Liste de musiques a cocher + ajout de musiques. Renseigne track['file']."""
+    ensure_music_list()
+    music = session_state.music_list
+    audio_types = [e.lstrip(".") for e in MUSIC_EXTENSIONS]
+    if music:
+        choice = st.radio("Musique de l'événement", list(music), key="music_choice")
+        key = music[choice]
+        try:
+            st.audio(download_music(key), format=AUDIO_MIME.get(splitext(key)[1].lower(), "audio/mpeg"))
+            track["file"] = S3Audio(key)
+        except Exception:
+            track["file"] = None
+            st.warning("Impossible de charger cette musique (connexion ?). Réessayez.")
+    else:
+        if music is None:
+            st.caption("Liste des musiques indisponible (connexion ?). Vous pouvez envoyer un fichier.")
+        else:
+            st.caption("Aucune musique enregistrée. Ajoutez-en ci-dessous, ou envoyez un fichier pour cette fois.")
+        track["file"] = st.file_uploader(
+            "Fichier audio (la musique de l'événement)",
+            type=audio_types,
+            key=track_idx * NB_KEYS_PER_AUDIO_TRACK,
+        )
+    refresh_col, add_col = st.columns(2)
+    with refresh_col:
+        if st.button("↻ Actualiser la liste", key="music_refresh"):
+            ensure_music_list(force=True)
+            st.rerun()
+    with add_col:
+        add = st.checkbox("➕ Ajouter des musiques", key="music_add_toggle")
+    if add:
+        new_files = st.file_uploader(
+            "Choisissez un ou plusieurs fichiers audio",
+            type=audio_types,
+            accept_multiple_files=True,
+            key=f"music_add_{session_state.get('music_add_key', 0)}",
+        )
+        if new_files and st.button("Enregistrer dans la liste", key="music_save"):
+            try:
+                n = save_music_files(new_files)
+                session_state.music_add_key = session_state.get("music_add_key", 0) + 1
+                ensure_music_list(force=True)
+                st.toast(f"{n} musique(s) enregistrée(s) ✓")
+                st.rerun()
+            except Exception:
+                st.error("Enregistrement impossible (connexion ou droits Scaleway).")
 
 
 def create_audio_track_inputs(track_idx: int, track: defaultdict):
     spec = [3, 1, 1, 1] if track_idx else [3, 1, 1]
     cols = st.columns(spec)
     with cols[0]:
-        track["file"] = st.file_uploader(
-            "Fichier audio (la musique de l'événement)",
-            type=["mp3", "wav", "m4a", "aac", "ogg", "flac"],
-            key=track_idx * NB_KEYS_PER_AUDIO_TRACK,
-        )
+        music_chooser(track, track_idx)
     with cols[1]:
         track["bpm"] = st.number_input(
             "BPM (rythme)",
@@ -300,6 +463,24 @@ def photo_section():
     counter.write(f"{nb_all} photo(s) prise(s) — {len(selected_paths())} cochée(s) pour la vidéo.")
     with st.expander("Envoyer des photos depuis cet appareil"):
         images_uploader()
+
+
+def current_zoom() -> float:
+    """Zoom de la camera actuellement choisie (avant ou arriere)."""
+    rear = session_state.get("cam_facing") == "Arrière"
+    return float(session_state.get("cam_zoom_rear" if rear else "cam_zoom_front", 1.0))
+
+
+def crop_center_zoom(data: bytes, zoom: float) -> bytes:
+    """Garde le centre de l'image (1/zoom de chaque cote) : meme zone que l'apercu zoome."""
+    with Image.open(BytesIO(data)) as im:
+        im = im.convert("RGB")
+        w, h = im.size
+        nw, nh = max(2, int(w / zoom)), max(2, int(h / zoom))
+        left, top = (w - nw) // 2, (h - nh) // 2
+        out = BytesIO()
+        im.crop((left, top, left + nw, top + nh)).save(out, format="JPEG", quality=95)
+        return out.getvalue()
 
 
 def restart_camera():
@@ -373,8 +554,10 @@ div[data-testid="stCameraInputWebcamComponent"] { width: 100%; }
 div[data-testid="stCameraInputWebcamStyledBox"] {
     width: 100% !important; height: var(--cam-side) !important; aspect-ratio: 1 / 1;
 }
+div[data-testid="stCameraInputWebcamStyledBox"] { overflow: hidden; }
 div[data-testid="stCameraInputWebcamStyledBox"] video {
     width: 100% !important; height: 100% !important; object-fit: cover;
+    scale: __ZOOM__; transform-origin: center center;
 }
 </style>
 """
@@ -384,7 +567,7 @@ def picture_from_camera():
     big = session_state.get("fullscreen_cam", True)
     if big:
         # Seul le carre qui sera filme est affiche (centre du flux), aussi grand que possible.
-        st.markdown(BIG_CAMERA_CSS, unsafe_allow_html=True)
+        st.markdown(BIG_CAMERA_CSS.replace("__ZOOM__", f"{current_zoom():.2f}"), unsafe_allow_html=True)
     # Ancien affichage : repere carre par bandeaux gris haut/bas (cale sur iPad portrait).
     if not big:
         st.markdown(
@@ -461,6 +644,9 @@ def picture_from_camera():
     if picture is not None:
         data = picture.getvalue()
         if is_valid_image(data):
+            zoom = current_zoom()
+            if big and zoom > 1.0:
+                data = crop_center_zoom(data, zoom)
             image_path = next_photo_path("photo")
             with open(image_path, "wb") as f:
                 f.write(data)
@@ -653,6 +839,7 @@ def create_new_clips():
             selected,
             file_stem=stem,
             mute=session_state.mute_video,
+            auto_enhance_on=session_state.auto_enhance_on,
             filter_name=session_state.filter_name,
             keep_colors=session_state.keep_colors,
             sat_min=session_state.sat_min,
@@ -708,6 +895,7 @@ def create_clip(
     contrast: int = video_editing.DEFAULT_CONTRAST,
     temperature: int = video_editing.DEFAULT_TEMPERATURE,
     tint: int = video_editing.DEFAULT_TINT,
+    auto_enhance_on: bool = False,
 ) -> tuple[str, float]:
     """
     ### Description:
@@ -743,6 +931,7 @@ def create_clip(
             contrast=contrast,
             temperature=temperature,
             tint=tint,
+            auto_enhance_on=auto_enhance_on,
         )
         return video_filename, track["duration"]
 
