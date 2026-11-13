@@ -10,6 +10,7 @@ from PIL import ImageFilter, ImageEnhance
 
 from moviepy.video.fx import Rotate, Crop
 from moviepy import Clip, ImageSequenceClip, AudioFileClip, clips_array
+from moviepy.audio.fx import AudioLoop
 
 
 # ---------------------------------------------------------------------------
@@ -169,7 +170,11 @@ def create_clip(
         image_paths, filter_name, keep_colors, sat_min, brightness, contrast, temperature, tint
     )
     # Load audio
-    audio = AudioFileClip(audio_path).with_duration(duration)
+    audio = AudioFileClip(audio_path)
+    # Musique plus courte que la video : on la fait boucler (sinon erreur de lecture)
+    if audio.duration is not None and audio.duration < duration:
+        audio = audio.with_effects([AudioLoop(duration=duration)])
+    audio = audio.with_duration(duration)
     fps = bpm / 60
     # Loop or trim image sequence to match duration
     nb_frames = max(int(fps * duration), 1)
