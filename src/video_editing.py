@@ -42,6 +42,103 @@ DEFAULT_TEMPERATURE = 0
 DEFAULT_TINT = 0
 
 
+# ---------------------------------------------------------------------------
+# Amelioration automatique ("protocole classe")
+# ---------------------------------------------------------------------------
+# Etapes, identiques pour toutes les photos d'une serie (pas de scintillement dans la video) :
+#   1. niveaux : noirs/blancs recales sur la photo (plafonne pour rester naturel)
+#   2. exposition : gamma pour amener le sujet (zone centrale) vers une luminosite agreable
+#   3. bruit : lissage de la couleur seulement (le bruit colore est le plus laid en basse lumiere)
+#   4. nettete : masque flou doux sur la luminosite
+#   5. couleurs : legere hausse de saturation
+# Ne rattrape pas une photo floue ou tres sous-exposee : ameliore, ne fait pas de miracle.
+ENHANCE_TARGET_MEAN = 0.46      # luminosite moyenne visee (0-1) au centre de l'image
+ENHANCE_MAX_SIDE = 2000         # taille max de travail (au-dela : reduit, evite la saturation memoire)
+ENHANCE_SATURATION = 1.08
+
+
+def _luma(a):
+    return a[..., 0] * 0.299 + a[..., 1] * 0.587 + a[..., 2] * 0.114
+
+
+def _small_rgb(img, side=256):
+    s = img.convert("RGB")
+    s.thumbnail((side, side))
+    return np.asarray(s, dtype=np.float32)
+
+
+def enhance_params(images):
+    """
+    Calcule UNE FOIS les reglages d'amelioration pour toute la serie (mediane des photos).
+    `images` : liste d'images PIL ou de chemins.
+    """
+    blacks, whites, lumas = [], [], []
+    for im in images:
+        if isinstance(im, (str, bytes)) or hasattr(im, "__fspath__"):
+            with Image.open(im) as f:
+                try:
+                    f.draft("RGB", (512, 512))
+                except Exception:
+                    pass
+                a = _small_rgb(f)
+        else:
+            a = _small_rgb(im)
+        y = _luma(a)
+        blacks.append(min(float(np.percentile(y, 0.5)), 40.0))
+        whites.append(max(float(np.percentile(y, 99.5)), 200.0))
+        h, w = y.shape
+        lumas.append(y[h // 5: h - h // 5, w // 5: w - w // 5])   # zone centrale = le sujet
+    if not lumas:
+        return None
+    black = float(np.median(blacks))
+    white = float(np.median(whites))
+    scale = 255.0 / max(white - black, 1.0)
+    means = [float((((c - black) * scale).clip(0, 255) / 255.0).mean()) for c in lumas]
+    m = min(max(float(np.median(means)), 0.05), 0.95)
+    gamma = float(np.clip(np.log(ENHANCE_TARGET_MEAN) / np.log(m), 0.70, 1.40))
+    if abs(gamma - 1.0) < 0.05:
+        gamma = 1.0
+    return {"black": black, "white": white, "gamma": gamma}
+
+
+def auto_enhance(img, params):
+    """Retourne une copie amelioree de l'image PIL. `params` vient de enhance_params()."""
+    img = img.convert("RGB")
+    if not params:
+        return img
+    if max(img.size) > ENHANCE_MAX_SIDE:
+        img = img.copy()
+        img.thumbnail((ENHANCE_MAX_SIDE, ENHANCE_MAX_SIDE), Image.LANCZOS)
+    # 1 + 2 : niveaux puis gamma, en une seule table de correspondance
+    scale = 255.0 / max(params["white"] - params["black"], 1.0)
+    x = ((np.arange(256) - params["black"]) * scale).clip(0, 255) / 255.0
+    lut = (np.power(x, params["gamma"]) * 255.0).round().clip(0, 255).astype("uint8").tolist()
+    img = img.point(lut * 3)
+    # 3 + 4 : bruit de couleur lisse, nettete sur la luminosite
+    side = min(img.size)
+    y, cb, cr = img.convert("YCbCr").split()
+    chroma_r = max(1.5, side / 450.0)
+    cb = cb.filter(ImageFilter.GaussianBlur(chroma_r))
+    cr = cr.filter(ImageFilter.GaussianBlur(chroma_r))
+    # bruit de luminosite : mesure sur le centre, puis lissage proportionnel (sinon la nettete amplifie le grain)
+    c = side // 2
+    crop = y.crop((c - min(c, 200), c - min(c, 200), c + min(c, 200), c + min(c, 200)))
+    ref = np.asarray(crop, dtype=np.float32)
+    med = np.asarray(crop.filter(ImageFilter.MedianFilter(3)), dtype=np.float32)
+    noise = float(np.median(np.abs(ref - med)) * 1.48)
+    if noise > 1.0:
+        weight = min(noise / 5.0, 1.0)
+        soft = np.asarray(y.filter(ImageFilter.GaussianBlur(min(0.6 + noise / 8.0, 1.4))), dtype=np.float32)
+        mixed = np.asarray(y, dtype=np.float32) * (1 - weight) + soft * weight
+        y = Image.fromarray(mixed.round().clip(0, 255).astype("uint8"))
+    y = y.filter(ImageFilter.UnsharpMask(
+        radius=min(max(side / 700.0, 1.0), 2.5), percent=60, threshold=max(3, int(noise * 2))
+    ))
+    img = Image.merge("YCbCr", (y, cb, cr)).convert("RGB")
+    # 5 : couleurs un peu plus vivantes
+    return ImageEnhance.Color(img).enhance(ENHANCE_SATURATION)
+
+
 def _hue_in_range(hue_deg, start, end):
     if start <= end:
         return (hue_deg >= start) & (hue_deg <= end)
@@ -85,8 +182,14 @@ def apply_filter(
     contrast=DEFAULT_CONTRAST,
     temperature=DEFAULT_TEMPERATURE,
     tint=DEFAULT_TINT,
+    enhance=None,
 ):
-    """Retourne une copie reglee puis filtree de l'image PIL (RGB). Ne modifie pas l'original."""
+    """
+    Retourne une copie reglee puis filtree de l'image PIL (RGB). Ne modifie pas l'original.
+    `enhance` : reglages d'amelioration automatique (enhance_params) ou None.
+    """
+    if enhance:
+        img = auto_enhance(img, enhance)
     img = adjust_image(img, brightness, contrast, temperature, tint)
     if filter_name == FILTER_BW:
         return img.convert("L").convert("RGB")
@@ -128,20 +231,24 @@ def apply_filter_to_files(
     contrast=DEFAULT_CONTRAST,
     temperature=DEFAULT_TEMPERATURE,
     tint=DEFAULT_TINT,
+    auto_enhance_on=False,
 ):
     """Cree des COPIES reglees/filtrees dans un dossier temporaire et renvoie leurs chemins."""
     if (
-        filter_name == FILTER_NONE
+        not auto_enhance_on
+        and filter_name == FILTER_NONE
         and not brightness and not contrast
         and not temperature and not tint
     ):
         return image_paths
+    params = enhance_params(image_paths) if auto_enhance_on else None
     out_dir = mkdtemp()
     filtered = []
     for i, path in enumerate(image_paths):
         with Image.open(path) as im:
             res = apply_filter(
-                im, filter_name, keep_colors, sat_min, brightness, contrast, temperature, tint
+                im, filter_name, keep_colors, sat_min, brightness, contrast, temperature, tint,
+                enhance=params,
             )
         fp = join(out_dir, f"filtered_{i}.jpg")
         res.save(fp, quality=95)
@@ -163,11 +270,13 @@ def create_clip(
     contrast: int = DEFAULT_CONTRAST,
     temperature: int = DEFAULT_TEMPERATURE,
     tint: int = DEFAULT_TINT,
+    auto_enhance_on: bool = False,
 ):
     center_crop_to_square(image_paths)
     # Reglages et filtre appliques sur des copies (les photos d'origine restent intactes)
     image_paths = apply_filter_to_files(
-        image_paths, filter_name, keep_colors, sat_min, brightness, contrast, temperature, tint
+        image_paths, filter_name, keep_colors, sat_min, brightness, contrast, temperature, tint,
+        auto_enhance_on=auto_enhance_on,
     )
     # Load audio
     audio = AudioFileClip(audio_path)
@@ -178,14 +287,19 @@ def create_clip(
     fps = bpm / 60
     # Loop or trim image sequence to match duration
     nb_frames = max(int(fps * duration), 1)
-    paths = [image_paths[i % len(image_paths)] for i in range(nb_frames)]
-    # Build the video
-    clip = ImageSequenceClip(paths, fps=fps)
-    # clip = crop_clip_to_square(clip)
-    clip = clips_array([
-        [clip, clip.with_effects([Rotate(270)])],
-        [clip.with_effects([Rotate(90)]), clip.with_effects([Rotate(180)])],
-    ])
+    # Le kaleidoscope 2x2 est calcule UNE fois par photo (et non a chaque image de la video) :
+    # beaucoup plus rapide, resultat identique. Meme disposition qu'avant :
+    #   [photo, rotation 270]
+    #   [rotation 90, rotation 180]
+    tiles = []
+    for path in image_paths:
+        with Image.open(path) as im:
+            a = np.array(im.convert("RGB"))
+        top = np.hstack([a, np.rot90(a, 3)])
+        bottom = np.hstack([np.rot90(a, 1), np.rot90(a, 2)])
+        tiles.append(np.ascontiguousarray(np.vstack([top, bottom])))
+    frames = [tiles[i % len(tiles)] for i in range(nb_frames)]
+    clip = ImageSequenceClip(frames, fps=fps)
     # Attacher l'audio sauf en mode muet (rythme et duree restent calcules sur l'audio)
     if not mute:
         clip = clip.with_audio(audio)
@@ -195,6 +309,7 @@ def create_clip(
             output_path,
             fps=fps,
             codec="libx264",
+            preset="veryfast",
             audio=False,
             write_logfile=False,
         )
@@ -203,6 +318,7 @@ def create_clip(
             output_path,
             fps=fps,
             codec="libx264",
+            preset="veryfast",
             audio_codec="aac",
             temp_audiofile="temp-audio.m4a",
             remove_temp=True,
