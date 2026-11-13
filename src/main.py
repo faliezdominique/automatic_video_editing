@@ -27,6 +27,10 @@ from config import (
 )
 from s3_utils import upload_file_to_bucket
 
+# Valeurs par defaut de la musique (remplacent celles de config.py)
+DEFAULT_BPM = 300.0       # rythme : 300 BPM = 5 images par seconde
+DEFAULT_DURATION = 20.0   # duree de la video en secondes
+
 
 # Position du gros bouton de prise de photo (fixe a l'ecran, pour pouvoir
 # appuyer depuis le cote sans etre dans le champ de la camera).
