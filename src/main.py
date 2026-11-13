@@ -28,9 +28,6 @@ from config import (
 from s3_utils import upload_file_to_bucket
 
 
-MODE_PHOTO = "📷 Photos"
-MODE_VIDEO = "🎬 Vidéo"
-
 # Position du gros bouton de prise de photo (fixe a l'ecran, pour pouvoir
 # appuyer depuis le cote sans etre dans le champ de la camera).
 BUTTON_POSITIONS = {
@@ -52,20 +49,15 @@ def main():
         setup_session_state()
     ensure_state()
     camera_big = session_state.get("fullscreen_cam", True)
-    if not (camera_big and session_state.get("mode", MODE_PHOTO) == MODE_PHOTO):
+    if not camera_big:
         st.title("Video Clip Creator")
     settings_section()
-    mode = st.radio(
-        "Mode",
-        [MODE_PHOTO, MODE_VIDEO],
-        horizontal=True,
-        key="mode",
-        label_visibility="collapsed",
-    )
-    if mode == MODE_PHOTO:
-        photo_section()
-    else:
-        video_section()
+    # Une seule page : camera, photos, video, historique
+    photo_section()
+    video_section()
+    display_history()
+    # Espace en bas de page : le gros bouton fixe ne masque pas le contenu
+    st.markdown('<div style="height: 180px"></div>', unsafe_allow_html=True)
 
 
 # ---------------------------------------------------------------------------
@@ -104,6 +96,7 @@ def ensure_state():
         "unchecked": lambda: set(),
         "camera_key": lambda: 0,
         "photo_added": lambda: False,
+        "pending_entry": lambda: None,
     }
     for key, factory in defaults.items():
         if key not in session_state:
@@ -209,6 +202,13 @@ def settings_section():
             value=True,
             key="fullscreen_cam",
         )
+        st.radio(
+            "Caméra utilisée",
+            ["Selfie (avant)", "Arrière"],
+            horizontal=True,
+            key="cam_facing",
+            on_change=restart_camera,
+        )
         st.selectbox(
             "Position du gros bouton de prise de photo",
             list(BUTTON_POSITIONS),
@@ -284,31 +284,74 @@ def create_audio_track_inputs(track_idx: int, track: defaultdict):
 def photo_section():
     picture_from_camera()
     nb_all = len(session_state.image_paths)
-    nb_sel = len(selected_paths())
     info_col, reset_col = st.columns([3, 1])
     with info_col:
-        st.write(f"{nb_all} photo(s) prise(s) — {nb_sel} cochée(s) pour la vidéo.")
+        counter = st.empty()
     with reset_col:
-        st.button("Reset Photos", on_click=reset_photos)
+        st.button("Réinitialiser les photos", on_click=reset_photos, key="reset_top")
     if nb_all:
         st.caption("Décochez les photos à écarter de la vidéo.")
         display_image_selector(session_state.image_paths)
+    # Le compteur est rempli apres les cases a cocher : il est toujours a jour
+    counter.write(f"{nb_all} photo(s) prise(s) — {len(selected_paths())} cochée(s) pour la vidéo.")
     with st.expander("Envoyer des photos depuis cet appareil"):
         images_uploader()
-    # Espace en bas de page : le gros bouton fixe ne masque pas le contenu
-    st.markdown('<div style="height: 180px"></div>', unsafe_allow_html=True)
+
+
+def restart_camera():
+    """Relance la camera (nouvelle cle) : le choix avant/arriere est pris en compte tout de suite."""
+    session_state.camera_key += 1
+
+
+# Apres chaque photo la camera est relancee (retour rapide au direct) et repart sur la camera avant.
+# Si « Arrière » est choisi, ce petit script appuie une fois sur le bouton « changer de camera ».
+REAR_CAMERA_JS = """
+<script>
+(function () {
+  var W = window.parent, doc = W.document;
+  W.__kaleidoRear = __REAR__;
+  if (doc.getElementById('kaleido-switch')) return;
+  var s = doc.createElement('script');
+  s.id = 'kaleido-switch';
+  s.textContent = '(' + function () {
+    setInterval(function () {
+      if (!window.__kaleidoRear) return;
+      document.querySelectorAll('div[data-testid="stCameraInput"]').forEach(function (w) {
+        if (w.dataset.kaleidoSwitched) return;
+        var btn = w.querySelector('[data-testid="stCameraInputSwitchButton"] button');
+        var v = w.querySelector('video');
+        if (btn && v && v.readyState >= 2) {
+          w.dataset.kaleidoSwitched = '1'; btn.click();
+          setTimeout(function () { w.dataset.kaleidoReady = '1'; }, 1500);
+        }
+      });
+    }, 400);
+  } + ')();';
+  doc.head.appendChild(s);
+})();
+</script>
+"""
 
 
 def reset_photos():
-    """Demarre une nouvelle serie : vide la liste des photos et la selection."""
+    """
+    Valide la video en cours (elle part dans l'historique) et repart a zero :
+    plus de photos, plus de video affichee, selection vide.
+    """
+    entry = session_state.get("pending_entry")
+    if entry:
+        session_state.history.insert(0, entry)
+        session_state.pending_entry = None
+    for clip in session_state.clips:
+        try:
+            os.remove(clip["path"])
+        except OSError:
+            pass
+    session_state.clips = []
+    session_state.zipped_clips_s3_url = None
     session_state.image_paths = []
     session_state.unchecked = set()
     session_state.series_key += 1
-
-
-def new_series():
-    reset_photos()
-    session_state.mode = MODE_PHOTO
 
 
 def next_photo_path(prefix: str) -> str:
@@ -397,6 +440,20 @@ def picture_from_camera():
         key=f"camera_{session_state.camera_key}",
         label_visibility="collapsed" if big else "visible",
     )
+    rear = session_state.get("cam_facing") == "Arrière"
+    html(REAR_CAMERA_JS.replace("__REAR__", "true" if rear else "false"), height=0)
+    if rear:
+        # Bouton grise pendant la bascule vers la camera arriere (evite une photo de la camera avant)
+        st.markdown(
+            """
+            <style>
+            div[data-testid="stCameraInput"]:not([data-kaleido-ready]) button[data-testid="stCameraInputButton"] {
+                opacity: 0.3; pointer-events: none;
+            }
+            </style>
+            """,
+            unsafe_allow_html=True,
+        )
     if picture is not None:
         data = picture.getvalue()
         if is_valid_image(data):
@@ -453,18 +510,30 @@ def display_image_carousel(image_paths):
     html(html_code, height=180)
 
 
+def square_thumb(path: str, size: int = 400):
+    """Vignette carree (centre de la photo) : c'est ce qui sera dans la video."""
+    with Image.open(path) as im:
+        im = im.convert("RGB")
+        w, h = im.size
+        side = min(w, h)
+        left, top = (w - side) // 2, (h - side) // 2
+        im = im.crop((left, top, left + side, top + side))
+        im.thumbnail((size, size))
+        return im
+
+
 def display_image_selector(image_paths):
     """
-    Affiche chaque photo avec une case a cocher.
+    Affiche chaque photo (en carre) avec une case a cocher.
     La selection est memorisee dans session_state.unchecked (les photos decochees),
-    pour rester correcte quand on change de mode ou qu'on demarre une nouvelle serie.
+    pour rester correcte apres chaque nouvelle photo et quand on demarre une nouvelle serie.
     """
-    cols = st.columns(4)
+    cols = st.columns(3)
     for idx, path in enumerate(image_paths):
-        with cols[idx % 4]:
+        with cols[idx % 3]:
             readable = True
             try:
-                st.image(path, width=140)
+                st.image(square_thumb(path), use_container_width=True)
             except Exception:
                 readable = False
                 st.warning("Photo illisible (ignorée)")
@@ -489,24 +558,25 @@ def display_image_selector(image_paths):
 def video_section():
     paths = selected_paths()
     nb_all = len(session_state.image_paths)
-    if nb_all == 0:
-        st.warning("Aucune photo pour le moment : passez en mode « Photos ».")
-    elif not paths:
-        st.warning("Toutes les photos sont décochées : repassez en mode « Photos » pour en cocher au moins une.")
-    else:
-        st.write(f"{len(paths)} photo(s) sélectionnée(s) sur {nb_all}.")
     track_has_file = lambda track: track["file"] is not None
-    if not all(map(track_has_file, session_state.audio_tracks)):
-        st.warning("Ajoutez un fichier audio pour chaque piste dans les réglages de la soirée.")
-    can_create = bool(paths) and all(map(track_has_file, session_state.audio_tracks))
+    has_audio = all(map(track_has_file, session_state.audio_tracks))
+    st.divider()
+    if nb_all == 0:
+        st.info("Prenez quelques photos avec le gros bouton, puis créez la vidéo.")
+    elif not paths:
+        st.warning("Toutes les photos sont décochées : cochez-en au moins une.")
+    if not has_audio:
+        st.warning("Ajoutez la musique dans les réglages de la soirée (Fichier audio).")
+    can_create = bool(paths) and has_audio
 
-    create = st.button("Créer la vidéo", type="primary", disabled=not can_create)
+    create = st.button("🎬 Créer la vidéo", type="primary", disabled=not can_create)
     if create:
-        create_new_clips()
+        with st.spinner("Création de la vidéo…"):
+            create_new_clips()
         st.rerun()
 
     if session_state.clips:
-        st.subheader("Dernière vidéo")
+        st.subheader("Vidéo")
         for clip in session_state.clips:
             try:
                 display_video(clip)
@@ -518,20 +588,20 @@ def video_section():
                 st.markdown(f"[link to all videos]({session_state.zipped_clips_s3_url})")
             with qrcode_col:
                 st.image(generate_qr_code(session_state.zipped_clips_s3_url), caption="Scannez pour tout récupérer (zip)")
-        if nb_all:
-            st.info("Pour le groupe suivant : appuyez sur « Nouvelle série » (les photos de ce groupe sont vidées).")
-            st.button("Nouvelle série (Reset Photos)", on_click=new_series)
-
-    display_history()
+        st.info(
+            "Satisfait ? Appuyez sur « Réinitialiser les photos » : la vidéo part dans l'historique "
+            "et vous repartez de zéro.  \nPas satisfait ? Cochez/décochez ou refaites des photos, "
+            "puis « Créer la vidéo » : la nouvelle version remplace celle-ci."
+        )
+        st.button("Réinitialiser les photos (valider la vidéo)", on_click=reset_photos, key="reset_bottom")
 
 
 def display_history():
     """Videos precedentes de la soiree (la plus recente en haut), avec vignette, lien et QR code."""
-    older = session_state.history[1:]
-    if not older:
+    if not session_state.history:
         return
     st.subheader("Historique de la soirée")
-    for entry in older:
+    for entry in session_state.history:
         thumb_col, text_col, qr_col = st.columns([1, 2, 1])
         with thumb_col:
             if entry.get("thumb") and os.path.exists(entry["thumb"]):
@@ -602,13 +672,13 @@ def create_new_clips():
         preview_image(selected[0], width=240).save(thumb_path, quality=85)
     except Exception:
         thumb_path = None
-    session_state.history.insert(0, {
+    session_state.pending_entry = {
         "label": event or clean_file_name(splitext(session_state.audio_tracks[0]["file"].name)[0]),
         "time": now.strftime("%H:%M:%S"),
         "thumb": thumb_path,
         "clips": [dict(c) for c in session_state.clips],
         "number": n,
-    })
+    }
 
 
 def clean_file_name(name: str, max_length: int = 60) -> str:
