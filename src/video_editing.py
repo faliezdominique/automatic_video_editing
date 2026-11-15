@@ -271,6 +271,7 @@ def create_clip(
     temperature: int = DEFAULT_TEMPERATURE,
     tint: int = DEFAULT_TINT,
     auto_enhance_on: bool = False,
+    reverse: bool = False,
 ):
     center_crop_to_square(image_paths)
     # Reglages et filtre appliques sur des copies (les photos d'origine restent intactes)
@@ -298,8 +299,16 @@ def create_clip(
         top = np.hstack([a, np.rot90(a, 3)])
         bottom = np.hstack([np.rot90(a, 1), np.rot90(a, 2)])
         tiles.append(np.ascontiguousarray(np.vstack([top, bottom])))
+    if reverse:
+        # Montage a l'envers : derniere photo prise en premier. On garde un nombre ENTIER de
+        # passages pour que la video commence sur la derniere photo et se termine sur la premiere.
+        tiles = tiles[::-1]
+        if nb_frames >= len(tiles):
+            nb_frames = (nb_frames // len(tiles)) * len(tiles)
     frames = [tiles[i % len(tiles)] for i in range(nb_frames)]
     clip = ImageSequenceClip(frames, fps=fps)
+    if reverse:
+        audio = audio.with_duration(clip.duration)  # la musique s'arrete avec la derniere image
     # Attacher l'audio sauf en mode muet (rythme et duree restent calcules sur l'audio)
     if not mute:
         clip = clip.with_audio(audio)
