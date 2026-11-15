@@ -73,6 +73,7 @@ def setup_session_state():
     session_state.selected_image_paths = []
     session_state.mute_video = False
     session_state.auto_enhance_on = True
+    session_state.save_photos = False
     session_state.filter_name = video_editing.FILTER_NONE
     session_state.keep_colors = []
     session_state.sat_min = video_editing.DEFAULT_SAT_MIN
@@ -231,6 +232,11 @@ def settings_section():
 
         # Option : couper le son de la video (le rythme et la duree restent cales sur l'audio)
         session_state.mute_video = st.checkbox("Couper le son de la vidéo", value=False, key="mute_checkbox")
+        session_state.save_photos = st.checkbox(
+            "💾 Sauvegarder aussi les photos sur Scaleway (en privé, à côté des vidéos)",
+            value=False,
+            key="save_photos_cb",
+        )
 
         st.markdown("**Caméra et bouton photo**")
         st.checkbox(
@@ -313,6 +319,39 @@ def music_client():
         aws_secret_access_key=st.secrets["SCW_SECRET_KEY"],
         config=Config(connect_timeout=5, read_timeout=20, retries={"max_attempts": 2}),
     )
+
+
+def backup_photos_async(paths: list, key_dir: str):
+    """
+    Envoie les photos d'origine sur Scaleway (en prive), dans le dossier de la video, SANS bloquer
+    la creation de la video. Les photos deja envoyees ne sont pas renvoyees. Echec = silencieux.
+    """
+    import threading
+
+    try:
+        done = session_state.setdefault("backed_up_photos", set())
+        todo = [p for p in paths if p not in done and os.path.exists(p)]
+        if not todo:
+            return
+        client, bucket = music_client(), st.secrets["BUCKET_NAME"]
+        done.update(todo)
+    except Exception:
+        return
+
+    def worker():
+        for path in todo:
+            try:
+                with open(path, "rb") as fh:
+                    client.put_object(
+                        Bucket=bucket,
+                        Key=f"{key_dir}/photos/{os.path.basename(path)}",
+                        Body=fh.read(),
+                        ContentType="image/jpeg",
+                    )
+            except Exception:
+                pass
+
+    threading.Thread(target=worker, daemon=True).start()
 
 
 def fetch_music_list():
@@ -461,8 +500,87 @@ def photo_section():
         display_image_selector(session_state.image_paths)
     # Le compteur est rempli apres les cases a cocher : il est toujours a jour
     counter.write(f"{nb_all} photo(s) prise(s) — {len(selected_paths())} cochée(s) pour la vidéo.")
+    if nb_all:
+        photos_download_block()
     with st.expander("Envoyer des photos depuis cet appareil"):
         images_uploader()
+
+
+def photos_to_export(only_checked: bool) -> list:
+    """Photos lisibles a exporter : toutes, ou seulement les cochees."""
+    if only_checked:
+        return selected_paths()
+    out = []
+    for path in session_state.image_paths:
+        try:
+            if os.path.exists(path) and os.path.getsize(path) > 0:
+                out.append(path)
+        except OSError:
+            pass
+    return out
+
+
+def build_photos_zip(paths: list, with_retouched: bool) -> bytes:
+    """Zip : dossier 'originales' (photos telles que prises) + 'retouchees' (reglages actuels)."""
+    buf = BytesIO()
+    with zipfile.ZipFile(buf, "w", zipfile.ZIP_STORED) as zf:
+        for i, path in enumerate(paths, 1):
+            zf.write(path, arcname=f"originales/photo_{i:02d}{splitext(path)[1] or '.jpg'}")
+        if with_retouched:
+            retouched = video_editing.apply_filter_to_files(
+                paths,
+                session_state.filter_name,
+                session_state.keep_colors,
+                session_state.sat_min,
+                session_state.brightness,
+                session_state.contrast,
+                session_state.temperature,
+                session_state.tint,
+                auto_enhance_on=session_state.auto_enhance_on,
+            )
+            if retouched != paths:  # sinon rien n'a ete modifie : inutile de doubler les fichiers
+                for i, path in enumerate(retouched, 1):
+                    zf.write(path, arcname=f"retouchees/photo_{i:02d}.jpg")
+    return buf.getvalue()
+
+
+def photos_download_block():
+    """Recuperer les photos de la serie en cours (a faire avant « Réinitialiser les photos »)."""
+    with st.expander("📥 Récupérer les photos"):
+        only_checked = st.checkbox("Seulement les photos cochées", value=False, key="zip_only_checked")
+        with_retouched = st.checkbox(
+            "Ajouter aussi les versions retouchées (réglages actuels)", value=True, key="zip_with_retouched"
+        )
+        paths = photos_to_export(only_checked)
+        signature = (
+            tuple(paths), with_retouched, session_state.auto_enhance_on, session_state.filter_name,
+            session_state.brightness, session_state.contrast, session_state.temperature, session_state.tint,
+        )
+        if st.button("Préparer le fichier", key="prepare_photos_zip", disabled=not paths):
+            with st.spinner("Préparation des photos…"):
+                try:
+                    session_state.photos_zip = {
+                        "data": build_photos_zip(paths, with_retouched),
+                        "sig": signature,
+                        "count": len(paths),
+                    }
+                except Exception as exc:
+                    session_state.photos_zip = None
+                    st.error(f"Impossible de préparer les photos : {exc}")
+        ready = session_state.get("photos_zip")
+        if ready and ready["sig"] == signature:
+            name = clean_file_name(session_state.event_name, max_length=40) if session_state.event_name.strip() else "photos"
+            stamp = datetime.now(ZoneInfo("Europe/Paris")).strftime("%Y%m%d_%H%M")
+            st.download_button(
+                f"⬇️ Télécharger {ready['count']} photo(s) (zip)",
+                data=ready["data"],
+                file_name=f"{name}_{stamp}.zip",
+                mime="application/zip",
+                key="download_photos_zip",
+            )
+        elif ready:
+            st.caption("Les photos ou les réglages ont changé : appuyez de nouveau sur « Préparer le fichier ».")
+        st.caption("Les photos ne sont pas conservées après « Réinitialiser » ni à la fermeture de la page : récupérez-les avant.")
 
 
 def current_zoom() -> float:
@@ -537,6 +655,7 @@ def reset_photos():
     session_state.image_paths = []
     session_state.unchecked = set()
     session_state.series_key += 1
+    session_state.photos_zip = None
 
 
 def next_photo_path(prefix: str) -> str:
@@ -759,6 +878,13 @@ def video_section():
         st.warning("Ajoutez la musique dans les réglages de la soirée (Fichier audio).")
     can_create = bool(paths) and has_audio
 
+    session_state.reverse_video = st.checkbox(
+        "⏪ Montage à l'envers (la dernière photo en premier)",
+        value=False,
+        key="reverse_cb",
+        help="Exemple : photo du groupe complet d'abord, puis on retire une personne à chaque photo. "
+             "La vidéo commence sur la dernière photo et se termine sur la première : le groupe se reconstitue.",
+    )
     create = st.button("🎬 Créer la vidéo", type="primary", disabled=not can_create)
     if create:
         with st.spinner("Création de la vidéo…"):
@@ -830,6 +956,8 @@ def create_new_clips():
     key_dir = join(event, datetime_str) if event else datetime_str
     selected = selected_paths()
     session_state.selected_image_paths = selected
+    if session_state.get("save_photos", False):
+        backup_photos_async(photos_to_export(False), key_dir)  # photos d'origine -> Scaleway (prive)
     multiple_tracks = len(session_state.audio_tracks) > 1
     for track in session_state.audio_tracks:
         audio_name = clean_file_name(splitext(track["file"].name)[0])
@@ -840,6 +968,7 @@ def create_new_clips():
             file_stem=stem,
             mute=session_state.mute_video,
             auto_enhance_on=session_state.auto_enhance_on,
+            reverse=session_state.get("reverse_video", False),
             filter_name=session_state.filter_name,
             keep_colors=session_state.keep_colors,
             sat_min=session_state.sat_min,
@@ -896,6 +1025,7 @@ def create_clip(
     temperature: int = video_editing.DEFAULT_TEMPERATURE,
     tint: int = video_editing.DEFAULT_TINT,
     auto_enhance_on: bool = False,
+    reverse: bool = False,
 ) -> tuple[str, float]:
     """
     ### Description:
@@ -915,10 +1045,17 @@ def create_clip(
         )
     # For some reason, I couldn't access the file provided by the fileuploader.
     # So create a temp file as aid band fix (yet another one).
+    work_dir = tempfile.mkdtemp()
+    work_paths = []
+    for i, path in enumerate(image_paths):
+        copy_path = os.path.join(work_dir, f"w_{i:03d}.jpg")
+        with Image.open(path) as src:
+            src.convert("RGB").save(copy_path, quality=97)
+        work_paths.append(copy_path)
     with tempfile.NamedTemporaryFile(suffix=audio_ext) as audio_file:
         audio_file.write(track["file"].getbuffer())
         video_editing.create_clip(
-            image_paths=image_paths,
+            image_paths=work_paths,
             audio_path=audio_file.name,
             bpm=track["bpm"],
             duration=track["duration"],
@@ -932,6 +1069,7 @@ def create_clip(
             temperature=temperature,
             tint=tint,
             auto_enhance_on=auto_enhance_on,
+            reverse=reverse,
         )
         return video_filename, track["duration"]
 
