@@ -60,6 +60,7 @@ def main():
     photo_section()
     video_section()
     display_history()
+    st.caption("Version du 15/11/2026 — 14h55")
     # Espace en bas de page : le gros bouton fixe ne masque pas le contenu
     st.markdown('<div style="height: 180px"></div>', unsafe_allow_html=True)
 
@@ -364,8 +365,10 @@ def fetch_music_list():
                 name = obj["Key"][len(MUSIC_PREFIX):]
                 if name and name.lower().endswith(MUSIC_EXTENSIONS):
                     found[splitext(name)[0]] = obj["Key"]
+        session_state.music_error = ""
         return dict(sorted(found.items()))
-    except Exception:
+    except Exception as exc:
+        session_state.music_error = f"{type(exc).__name__}: {str(exc)[:240]}"
         return None
 
 
@@ -399,6 +402,12 @@ def save_music_files(files) -> int:
     return saved
 
 
+def delete_music(key: str):
+    """Supprime definitivement une musique du bucket."""
+    music_client().delete_object(Bucket=st.secrets["BUCKET_NAME"], Key=key)
+    download_music.clear()
+
+
 class S3Audio:
     """Musique du bucket, utilisable comme un fichier envoye (memes .name et .getbuffer())."""
 
@@ -424,9 +433,12 @@ def music_chooser(track: defaultdict, track_idx: int):
         except Exception:
             track["file"] = None
             st.warning("Impossible de charger cette musique (connexion ?). Réessayez.")
+        st.caption(f"{len(music)} musique(s) dans la liste.")
     else:
         if music is None:
-            st.caption("Liste des musiques indisponible (connexion ?). Vous pouvez envoyer un fichier.")
+            st.caption("Liste des musiques indisponible (connexion ou droits Scaleway ?). Vous pouvez envoyer un fichier.")
+            if session_state.get("music_error"):
+                st.caption(f"Détail technique : {session_state.music_error}")
         else:
             st.caption("Aucune musique enregistrée. Ajoutez-en ci-dessous, ou envoyez un fichier pour cette fois.")
         track["file"] = st.file_uploader(
@@ -455,8 +467,31 @@ def music_chooser(track: defaultdict, track_idx: int):
                 ensure_music_list(force=True)
                 st.toast(f"{n} musique(s) enregistrée(s) ✓")
                 st.rerun()
-            except Exception:
-                st.error("Enregistrement impossible (connexion ou droits Scaleway).")
+            except Exception as exc:
+                st.error(f"Enregistrement impossible : {type(exc).__name__}: {str(exc)[:200]}")
+    music_extras(track, track_idx, music)
+
+
+def music_extras(track: defaultdict, track_idx: int, music):
+    """Supprimer une musique de la liste, ou utiliser un fichier une seule fois sans l'enregistrer."""
+    if not music:
+        return
+    audio_types = [e.lstrip(".") for e in MUSIC_EXTENSIONS]
+    if st.checkbox("📎 Utiliser un fichier une seule fois (sans l'enregistrer)", key="music_oneoff_toggle"):
+        once = st.file_uploader("Fichier audio", type=audio_types, key=track_idx * NB_KEYS_PER_AUDIO_TRACK)
+        if once is not None:
+            track["file"] = once
+    if st.checkbox("🗑 Supprimer une musique de la liste", key="music_del_toggle"):
+        victim = st.selectbox("Musique à supprimer", list(music), key="music_del_choice")
+        st.caption("La musique sera supprimée définitivement de Scaleway.")
+        if st.button("Supprimer définitivement", key="music_delete"):
+            try:
+                delete_music(music[victim])
+                ensure_music_list(force=True)
+                st.toast(f"« {victim} » supprimée ✓")
+                st.rerun()
+            except Exception as exc:
+                st.error(f"Suppression impossible : {type(exc).__name__}: {str(exc)[:200]}")
 
 
 def create_audio_track_inputs(track_idx: int, track: defaultdict):
@@ -500,6 +535,12 @@ def photo_section():
         display_image_selector(session_state.image_paths)
     # Le compteur est rempli apres les cases a cocher : il est toujours a jour
     counter.write(f"{nb_all} photo(s) prise(s) — {len(selected_paths())} cochée(s) pour la vidéo.")
+    if nb_all:
+        try:
+            with Image.open(session_state.image_paths[-1]) as last:
+                st.caption(f"Taille de la dernière photo : {last.size[0]} × {last.size[1]} pixels ({last.size[0] * last.size[1] / 1e6:.1f} Mpx)")
+        except Exception:
+            pass
     if nb_all:
         photos_download_block()
     with st.expander("Envoyer des photos depuis cet appareil"):
