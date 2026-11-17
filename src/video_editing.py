@@ -434,6 +434,37 @@ def apply_filter_to_files(
     return filtered
 
 
+def make_tile(a: "np.ndarray") -> "np.ndarray":
+    """Kaleidoscope 2x2 d'une photo (tableau RGB) : photo, rotation 270 / rotation 90, rotation 180."""
+    top = np.hstack([a, np.rot90(a, 3)])
+    bottom = np.hstack([np.rot90(a, 1), np.rot90(a, 2)])
+    return np.ascontiguousarray(np.vstack([top, bottom]))
+
+
+def load_overlay(source, side: int):
+    """Calque PNG (logo, phrase...) pret a etre pose sur le carre final de cote `side`.
+    `source` : chemin ou octets. Un calque non carre est centre, sans deformation.
+    Retourne (couleurs deja multipliees par la transparence, 1 - transparence)."""
+    from io import BytesIO
+
+    with Image.open(BytesIO(source) if isinstance(source, (bytes, bytearray)) else source) as im:
+        im = im.convert("RGBA")
+    w, h = im.size
+    scale = side / max(w, h)
+    nw, nh = max(1, round(w * scale)), max(1, round(h * scale))
+    im = im.resize((nw, nh), Image.LANCZOS)
+    canvas = Image.new("RGBA", (side, side), (0, 0, 0, 0))
+    canvas.paste(im, ((side - nw) // 2, (side - nh) // 2))
+    a = np.asarray(canvas).astype(np.float32)
+    alpha = a[..., 3:4] / 255.0
+    return a[..., :3] * alpha, 1.0 - alpha
+
+
+def blend_overlay(arr: "np.ndarray", overlay) -> "np.ndarray":
+    pre, inv = overlay
+    return np.clip(arr * inv + pre, 0, 255).astype(np.uint8)
+
+
 def create_clip(
     image_paths: list[str],
     audio_path: str,
@@ -452,6 +483,7 @@ def create_clip(
     reverse: bool = False,
     extras: dict = None,
     multiply: int = 0,
+    overlay_path: str = None,
 ):
     center_crop_to_square(image_paths)
     # Reglages et filtre appliques sur des copies (les photos d'origine restent intactes)
@@ -476,9 +508,7 @@ def create_clip(
     for path in image_paths:
         with Image.open(path) as im:
             a = np.array(im.convert("RGB"))
-        top = np.hstack([a, np.rot90(a, 3)])
-        bottom = np.hstack([np.rot90(a, 1), np.rot90(a, 2)])
-        tiles.append(np.ascontiguousarray(np.vstack([top, bottom])))
+        tiles.append(make_tile(a))
     # Demultiplication progressive : la video demarre en x4 (la photo 4 fois dans le carre, comme
     # d'habitude) puis le kaleidoscope est lui-meme repete : x16, puis x64 si demande, et on revient en x4.
     # La taille de la video ne change pas : les carres deviennent simplement plus petits.
@@ -496,6 +526,11 @@ def create_clip(
                 for t in base
             ]
             levels.append(small)
+    if overlay_path:
+        # Calque (logo, phrase...) pose UNE fois par image distincte, sur le carre final entier
+        # (pas sur chacun des petits carres).
+        ov = load_overlay(overlay_path, levels[0][0].shape[0])
+        levels = [[blend_overlay(t, ov) for t in lvl] for lvl in levels]
     if reverse:
         # Montage a l'envers : derniere photo prise en premier. On garde un nombre ENTIER de
         # passages pour que la video commence sur la derniere photo et se termine sur la premiere.
