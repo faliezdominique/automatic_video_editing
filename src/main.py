@@ -25,7 +25,7 @@ from config import (
     NB_KEYS_PER_AUDIO_TRACK,
     DUPLICATE_VIDEO_DOWNLOAD_KEY,
 )
-from s3_utils import upload_file_to_bucket
+from s3_utils import upload_file_to_bucket, create_s3_key_url
 
 # Valeurs par defaut de la musique (remplacent celles de config.py)
 DEFAULT_BPM = 300.0       # rythme : 300 BPM = 5 images par seconde
@@ -60,7 +60,8 @@ def main():
     photo_section()
     video_section()
     display_history()
-    st.caption("Version du 15/11/2026 — 14h55")
+    library_section()
+    st.caption("Version du 17/11/2026 — 17h30")
     # Espace en bas de page : le gros bouton fixe ne masque pas le contenu
     st.markdown('<div style="height: 180px"></div>', unsafe_allow_html=True)
 
@@ -74,6 +75,7 @@ def setup_session_state():
     session_state.selected_image_paths = []
     session_state.mute_video = False
     session_state.auto_enhance_on = True
+    session_state.extras = None
     session_state.save_photos = False
     session_state.filter_name = video_editing.FILTER_NONE
     session_state.keep_colors = []
@@ -143,11 +145,26 @@ def selected_paths() -> list:
 # ---------------------------------------------------------------------------
 def settings_section():
     with st.expander("⚙️ Réglages de la soirée", expanded=True):
+        # Le nom est garde dans l'adresse de la page (?evenement=...) : si la page se recharge ou plante,
+        # le meme nom revient tout seul et les nouvelles videos retombent dans le meme dossier.
+        if "event_name_input" not in session_state:
+            try:
+                session_state.event_name_input = st.query_params.get("evenement", "")
+            except Exception:
+                session_state.event_name_input = ""
         session_state.event_name = st.text_input(
             "Nom de l'événement (sert à nommer les vidéos)",
             key="event_name_input",
             placeholder="ex : Soirée EDF",
         )
+        try:
+            wanted = session_state.event_name.strip()
+            if wanted and st.query_params.get("evenement", "") != wanted:
+                st.query_params["evenement"] = wanted
+            elif not wanted and "evenement" in st.query_params:
+                del st.query_params["evenement"]
+        except Exception:
+            pass
 
         st.markdown("**Son**")
         # Une seule musique par evenement
@@ -181,6 +198,7 @@ def settings_section():
                 "Teinte (− vert / + magenta)", min_value=-50, max_value=50,
                 value=video_editing.DEFAULT_TINT, step=5, key="tint_slider",
             )
+        looks_section()
         session_state.filter_name = st.selectbox("Filtre", video_editing.FILTER_NAMES, key="filter_select")
         if session_state.filter_name == video_editing.FILTER_BW_COLORS:
             st.caption("Couleurs à conserver (le reste passe en noir et blanc) :")
@@ -224,7 +242,7 @@ def settings_section():
                 st.image(square_thumb(paths[ref_idx], 700), caption="Avant", use_container_width=True)
             with after_col:
                 try:
-                    after = preview_image(paths[ref_idx], width=700, enhance=params)
+                    after = preview_image(paths[ref_idx], width=700, enhance=params, extras=session_state.extras)
                     st.image(after, caption="Après", use_container_width=True)
                 except Exception:
                     st.caption("Aperçu indisponible pour cette photo.")
@@ -273,7 +291,116 @@ def settings_section():
 
 
 
-def preview_image(path: str, width: int = 600, enhance=None):
+# ---------------------------------------------------------------------------
+# Looks : ambiances de couleur (integres + fichiers .cube enregistres sur Scaleway)
+# ---------------------------------------------------------------------------
+LOOK_PREFIX = "looks/"
+
+
+def fetch_look_list():
+    """{nom: cle} des looks .cube du bucket, ou None si Scaleway est injoignable."""
+    try:
+        client, bucket = music_client(), st.secrets["BUCKET_NAME"]
+        found = {}
+        for page in client.get_paginator("list_objects_v2").paginate(Bucket=bucket, Prefix=LOOK_PREFIX):
+            for obj in page.get("Contents", []):
+                name = obj["Key"][len(LOOK_PREFIX):]
+                if name.lower().endswith(".cube"):
+                    found[splitext(name)[0]] = obj["Key"]
+        session_state.look_error = ""
+        return dict(sorted(found.items()))
+    except Exception as exc:
+        session_state.look_error = f"{type(exc).__name__}: {str(exc)[:200]}"
+        return None
+
+
+@st.cache_resource(show_spinner=False, max_entries=20)
+def load_custom_look(key: str):
+    data = music_client().get_object(Bucket=st.secrets["BUCKET_NAME"], Key=key)["Body"].read()
+    return video_editing.parse_cube(data)
+
+
+def looks_section():
+    """Choix du look, intensite, ombres, ajout/suppression de looks .cube. Renseigne session_state.extras."""
+    if "look_list" not in session_state:
+        session_state.look_list = fetch_look_list()
+    custom = session_state.look_list or {}
+    mine = {f"📁 {name}": key for name, key in custom.items()}
+    options = [video_editing.LOOK_NONE] + video_editing.BUILTIN_LOOK_NAMES + list(mine)
+    choice = st.selectbox("Look (ambiance de couleur)", options, key="look_select")
+    strength = 100
+    lut = None
+    if choice != video_editing.LOOK_NONE:
+        strength = st.slider("Intensité du look", min_value=0, max_value=100, value=100, step=5, key="look_strength")
+        try:
+            lut = load_custom_look(mine[choice]) if choice in mine else video_editing.builtin_look(choice)
+        except Exception as exc:
+            lut = None
+            st.warning(f"Ce look ne peut pas être lu : {str(exc)[:120]}")
+    shadows = st.slider(
+        "Déboucher les ombres (utile si la lumière vient d'un seul côté)",
+        min_value=0, max_value=100, value=0, step=5, key="shadows_slider",
+    )
+    skin = st.slider(
+        "Lissage léger de la peau",
+        min_value=0, max_value=100, value=0, step=5, key="skin_slider",
+        help="Atténue les petits défauts dans les zones de teinte peau, en gardant yeux, lèvres et cheveux nets. "
+             "Repéré par la couleur : des objets de teinte chair peuvent être légèrement lissés aussi.",
+    )
+    session_state.extras = {
+        "look": lut, "look_strength": strength / 100.0, "shadows": float(shadows), "skin": float(skin),
+    }
+    session_state.extras_sig = (choice, strength, shadows, skin)
+
+    if st.checkbox("➕ Ajouter ou supprimer mes looks (.cube)", key="look_manage_toggle"):
+        st.caption(
+            "Créez un look dans Photoshop, Lightroom ou DaVinci et exportez-le en LUT 3D (fichier .cube). "
+            "Il s'appliquera à toutes les photos."
+        )
+        if session_state.look_list is None:
+            st.caption(f"Liste de vos looks indisponible (connexion ou droits Scaleway ?) {session_state.get('look_error', '')}")
+        files = st.file_uploader(
+            "Fichiers .cube", type=["cube"], accept_multiple_files=True,
+            key=f"look_add_{session_state.get('look_add_key', 0)}",
+        )
+        if files and st.button("Enregistrer ces looks", key="look_save"):
+            saved, problems = 0, []
+            for f in files:
+                try:
+                    video_editing.parse_cube(f.getvalue())  # on verifie avant d'enregistrer
+                    music_client().put_object(
+                        Bucket=st.secrets["BUCKET_NAME"],
+                        Key=f"{LOOK_PREFIX}{clean_file_name(splitext(f.name)[0])}.cube",
+                        Body=f.getvalue(),
+                    )
+                    saved += 1
+                except ValueError as exc:
+                    problems.append(f"{f.name} : {exc}")
+                except Exception as exc:
+                    problems.append(f"{f.name} : enregistrement impossible ({type(exc).__name__})")
+            load_custom_look.clear()
+            session_state.look_add_key = session_state.get("look_add_key", 0) + 1
+            session_state.look_list = fetch_look_list()
+            if saved:
+                st.toast(f"{saved} look(s) enregistré(s) ✓")
+            if problems:
+                st.error("Non enregistrés : " + " ; ".join(problems))
+            else:
+                st.rerun()
+        if custom:
+            victim = st.selectbox("Look à supprimer", list(custom), key="look_del_choice")
+            if st.button("Supprimer ce look définitivement", key="look_delete"):
+                try:
+                    music_client().delete_object(Bucket=st.secrets["BUCKET_NAME"], Key=custom[victim])
+                    load_custom_look.clear()
+                    session_state.look_list = fetch_look_list()
+                    st.toast(f"« {victim} » supprimé ✓")
+                    st.rerun()
+                except Exception as exc:
+                    st.error(f"Suppression impossible : {type(exc).__name__}: {str(exc)[:160]}")
+
+
+def preview_image(path: str, width: int = 600, enhance=None, extras=None):
     """Retourne une petite version de la photo avec les reglages et le filtre courants."""
     with Image.open(path) as im:
         small = im.convert("RGB")
@@ -292,6 +419,7 @@ def preview_image(path: str, width: int = 600, enhance=None):
         session_state.temperature,
         session_state.tint,
         enhance=enhance,
+        extras=extras,
     )
 
 
@@ -578,6 +706,7 @@ def build_photos_zip(paths: list, with_retouched: bool) -> bytes:
                 session_state.temperature,
                 session_state.tint,
                 auto_enhance_on=session_state.auto_enhance_on,
+                extras=session_state.extras,
             )
             if retouched != paths:  # sinon rien n'a ete modifie : inutile de doubler les fichiers
                 for i, path in enumerate(retouched, 1):
@@ -595,6 +724,7 @@ def photos_download_block():
         paths = photos_to_export(only_checked)
         signature = (
             tuple(paths), with_retouched, session_state.auto_enhance_on, session_state.filter_name,
+            session_state.get("extras_sig"),
             session_state.brightness, session_state.contrast, session_state.temperature, session_state.tint,
         )
         if st.button("Préparer le fichier", key="prepare_photos_zip", disabled=not paths):
@@ -926,6 +1056,21 @@ def video_section():
         help="Exemple : photo du groupe complet d'abord, puis on retire une personne à chaque photo. "
              "La vidéo commence sur la dernière photo et se termine sur la première : le groupe se reconstitue.",
     )
+    session_state.multiply_video = st.checkbox(
+        "🔳 Démultiplier les carrés au fil de la vidéo",
+        value=False,
+        key="multiply_cb",
+        help="La vidéo commence comme d'habitude (la photo 4 fois dans le carré), puis les carrés "
+             "se multiplient : ×16, puis ×64 si vous le choisissez. La taille de la vidéo ne change pas.",
+    )
+    if session_state.multiply_video:
+        session_state.multiply_max = st.radio(
+            "Aller jusqu'à",
+            [16, 64],
+            format_func=lambda v: f"×{v} (4 → 16 carrés)" if v == 16 else f"×{v} (4 → 16 → 64 carrés)",
+            horizontal=True,
+            key="multiply_max_radio",
+        )
     create = st.button("🎬 Créer la vidéo", type="primary", disabled=not can_create)
     if create:
         with st.spinner("Création de la vidéo…"):
@@ -951,6 +1096,188 @@ def video_section():
             "puis « Créer la vidéo » : la nouvelle version remplace celle-ci."
         )
         st.button("Réinitialiser les photos (valider la vidéo)", on_click=reset_photos, key="reset_bottom")
+
+
+# ---------------------------------------------------------------------------
+# Bibliotheque : retrouver les seances passees (videos + photos) depuis l'application
+# ---------------------------------------------------------------------------
+SESSION_DIR_RE = re.compile(r"^\d{2}-\d{2}-\d{4}:\d{2}-\d{2}-\d{2}$")
+NO_EVENT_LABEL = "(sans nom d'événement)"
+
+
+def scan_library():
+    """
+    Parcourt le bucket et regroupe par evenement puis par seance :
+    {evenement: {seance: {"videos": [...], "photos": [...], "zip": cle|None}}}
+    """
+    client, bucket = music_client(), st.secrets["BUCKET_NAME"]
+    library = {}
+    for page in client.get_paginator("list_objects_v2").paginate(Bucket=bucket):
+        for obj in page.get("Contents", []):
+            key = obj["Key"]
+            parts = key.split("/")
+            if parts[0] in ("musiques", "looks") or len(parts) < 2 and not key.endswith(".zip"):
+                continue
+            # le zip des videos d'une seance s'appelle "<seance>.zip" a cote du dossier
+            if parts[-1].lower().endswith(".zip") and SESSION_DIR_RE.match(parts[-1][:-4]):
+                event = "/".join(parts[:-1]) or NO_EVENT_LABEL
+                library.setdefault(event, {}).setdefault(parts[-1][:-4], {"videos": [], "photos": [], "zip": None, "sizes": {}})["zip"] = key
+                continue
+            idx = next((i for i, part in enumerate(parts) if SESSION_DIR_RE.match(part)), None)
+            if idx is None:
+                continue
+            event = "/".join(parts[:idx]) or NO_EVENT_LABEL
+            entry = library.setdefault(event, {}).setdefault(parts[idx], {"videos": [], "photos": [], "zip": None, "sizes": {}})
+            entry["sizes"][key] = obj.get("Size", 0)
+            rest = parts[idx + 1:]
+            if rest and rest[0] == "photos" and len(rest) > 1:
+                entry["photos"].append(key)
+            elif rest and rest[-1].lower().endswith(".mp4"):
+                entry["videos"].append(key)
+    return library
+
+
+def session_datetime(session_name: str):
+    try:
+        return datetime.strptime(session_name, "%d-%m-%Y:%H-%M-%S")
+    except ValueError:
+        return datetime.min
+
+
+def session_label(session_name: str, entry: dict) -> str:
+    when = session_datetime(session_name)
+    day = when.strftime("%d/%m/%Y à %H:%M") if when != datetime.min else session_name
+    return f"{day} — {len(entry['videos'])} vidéo(s), {len(entry['photos'])} photo(s)"
+
+
+@st.cache_data(max_entries=80, show_spinner=False)
+def fetch_object_bytes(key: str) -> bytes:
+    return music_client().get_object(Bucket=st.secrets["BUCKET_NAME"], Key=key)["Body"].read()
+
+
+def zip_objects(items: list) -> bytes:
+    """items : liste de (cle Scaleway, nom dans le zip). Telecharge et assemble en memoire."""
+    buf = BytesIO()
+    with zipfile.ZipFile(buf, "w", zipfile.ZIP_STORED) as zf:
+        for key, arcname in items:
+            zf.writestr(arcname, music_client().get_object(Bucket=st.secrets["BUCKET_NAME"], Key=key)["Body"].read())
+    return buf.getvalue()
+
+
+MAX_ZIP_MB = 250   # au-dela, l'hebergement gratuit risque de manquer de memoire : on propose seance par seance
+
+
+def library_download_all(library: dict, event: str, session_name: str):
+    """Boutons « tout telecharger » : la seance (videos + photos) ou tout l'evenement."""
+    entry = library[event][session_name]
+    session_items = [(k, f"videos/{k.split('/')[-1]}") for k in sorted(entry["videos"])]
+    session_items += [(k, f"photos/{k.split('/')[-1]}") for k in sorted(entry["photos"])]
+    session_mb = sum(entry["sizes"].get(k, 0) for k, _ in session_items) / 1e6
+    event_items = []
+    for name in sorted(library[event], key=session_datetime):
+        e = library[event][name]
+        folder = name.replace(":", "-")
+        event_items += [(k, f"{folder}/videos/{k.split('/')[-1]}") for k in sorted(e["videos"])]
+        event_items += [(k, f"{folder}/photos/{k.split('/')[-1]}") for k in sorted(e["photos"])]
+    event_mb = sum(
+        library[event][n]["sizes"].get(k, 0) for n in library[event]
+        for k in library[event][n]["videos"] + library[event][n]["photos"]
+    ) / 1e6
+    safe_event = clean_file_name(event, max_length=40)
+    for label, items, size_mb, ident, file_name in (
+        ("cette séance", session_items, session_mb, ("session", event, session_name),
+         f"{safe_event}_{session_name.replace(':', '-')}_tout.zip"),
+        (f"tout l'événement « {event} »", event_items, event_mb, ("event", event, ""),
+         f"{safe_event}_evenement_complet.zip"),
+    ):
+        if not items:
+            continue
+        if size_mb > MAX_ZIP_MB:
+            st.caption(f"Télécharger {label} d'un seul coup ({size_mb:.0f} Mo) est trop lourd ici : faites-le séance par séance.")
+            continue
+        if st.button(f"📦 Préparer tout télécharger : {label} ({size_mb:.0f} Mo)", key=f"all_prepare_{ident[0]}"):
+            with st.spinner("Préparation du zip, cela peut prendre un moment…"):
+                try:
+                    session_state.library_all = {"id": ident, "data": zip_objects(items)}
+                except Exception as exc:
+                    st.error(f"Préparation impossible : {type(exc).__name__}: {str(exc)[:160]}")
+        ready = session_state.get("library_all")
+        if ready and ready["id"] == ident:
+            st.download_button(f"⬇️ Télécharger {label} (zip)", data=ready["data"], file_name=file_name,
+                               mime="application/zip", key=f"all_download_{ident[0]}")
+
+
+def library_section():
+    """Retrouver ses seances passees : videos (lecteur + lien), photos (miniatures + zip)."""
+    with st.expander("📚 Retrouver mes séances (vidéos et photos)"):
+        if st.button("🔄 Charger / actualiser la liste", key="library_refresh"):
+            with st.spinner("Lecture de Scaleway…"):
+                try:
+                    session_state.library = scan_library()
+                    session_state.library_error = ""
+                except Exception as exc:
+                    session_state.library = None
+                    session_state.library_error = f"{type(exc).__name__}: {str(exc)[:200]}"
+        if session_state.get("library_error"):
+            st.error(f"Lecture impossible (connexion ou droits Scaleway ?) {session_state.library_error}")
+        library = session_state.get("library")
+        if not library:
+            st.caption("Appuyez sur « Charger » pour voir vos événements, classés par date.")
+            return
+        events = sorted(
+            library,
+            key=lambda ev: max(session_datetime(name) for name in library[ev]),
+            reverse=True,
+        )
+        event = st.selectbox("Événement", events, key="library_event")
+        sessions = sorted(library[event], key=session_datetime, reverse=True)
+        session_name = st.selectbox(
+            "Séance",
+            sessions,
+            format_func=lambda name: session_label(name, library[event][name]),
+            key="library_session",
+        )
+        entry = library[event][session_name]
+        for key in sorted(entry["videos"]):
+            url = create_s3_key_url(key)
+            st.video(url)
+            st.code(url, language=None)
+        if entry["zip"]:
+            st.markdown(f"[⬇️ Zip des vidéos de cette séance]({create_s3_key_url(entry['zip'])})")
+        library_download_all(library, event, session_name)
+        if not entry["photos"]:
+            st.caption("Aucune photo sauvegardée pour cette séance (la case « Sauvegarder aussi les photos » n'était pas cochée).")
+            return
+        st.markdown(f"**{len(entry['photos'])} photo(s) sauvegardée(s)**")
+        photos = sorted(entry["photos"])
+        shown = photos[:12]
+        cols = st.columns(3)
+        for i, key in enumerate(shown):
+            try:
+                with Image.open(BytesIO(fetch_object_bytes(key))) as im:
+                    thumb = im.convert("RGB")
+                    thumb.thumbnail((400, 400))
+                cols[i % 3].image(thumb, use_container_width=True)
+            except Exception:
+                cols[i % 3].caption("(photo illisible)")
+        if len(photos) > len(shown):
+            st.caption(f"+ {len(photos) - len(shown)} autres photos dans le zip.")
+        if st.button("Préparer le zip des photos", key="library_zip_prepare"):
+            with st.spinner("Préparation…"):
+                buf = BytesIO()
+                with zipfile.ZipFile(buf, "w", zipfile.ZIP_STORED) as zf:
+                    for key in photos:
+                        zf.writestr(key.split("/")[-1], fetch_object_bytes(key))
+                session_state.library_zip = {"id": (event, session_name), "data": buf.getvalue()}
+        zip_ready = session_state.get("library_zip")
+        if zip_ready and zip_ready["id"] == (event, session_name):
+            st.download_button(
+                f"⬇️ Télécharger les {len(photos)} photos (zip)",
+                data=zip_ready["data"],
+                file_name=f"photos_{clean_file_name(event, max_length=40)}_{session_name.replace(':', '-')}.zip",
+                mime="application/zip",
+                key="library_zip_download",
+            )
 
 
 def display_history():
@@ -1009,7 +1336,9 @@ def create_new_clips():
             file_stem=stem,
             mute=session_state.mute_video,
             auto_enhance_on=session_state.auto_enhance_on,
+            extras=session_state.extras,
             reverse=session_state.get("reverse_video", False),
+            multiply=(session_state.get("multiply_max", 16) if session_state.get("multiply_video", False) else 0),
             filter_name=session_state.filter_name,
             keep_colors=session_state.keep_colors,
             sat_min=session_state.sat_min,
@@ -1067,6 +1396,8 @@ def create_clip(
     tint: int = video_editing.DEFAULT_TINT,
     auto_enhance_on: bool = False,
     reverse: bool = False,
+    extras: dict = None,
+    multiply: int = 0,
 ) -> tuple[str, float]:
     """
     ### Description:
@@ -1111,6 +1442,8 @@ def create_clip(
             tint=tint,
             auto_enhance_on=auto_enhance_on,
             reverse=reverse,
+            extras=extras,
+            multiply=multiply,
         )
         return video_filename, track["duration"]
 
