@@ -9,7 +9,7 @@ import numpy as np
 from PIL import ImageFilter, ImageEnhance
 
 from moviepy.video.fx import Rotate, Crop
-from moviepy import Clip, ImageSequenceClip, AudioFileClip, clips_array
+from moviepy import Clip, ImageSequenceClip, VideoClip, AudioFileClip, clips_array
 from moviepy.audio.fx import AudioLoop
 
 
@@ -139,6 +139,179 @@ def auto_enhance(img, params):
     return ImageEnhance.Color(img).enhance(ENHANCE_SATURATION)
 
 
+# ---------------------------------------------------------------------------
+# Looks (ambiances de couleur) : tables 3D (LUT), fichiers .cube ou looks integres
+# ---------------------------------------------------------------------------
+# Un look = une table de correspondance de couleurs appliquee a TOUTES les photos (rapide : calcul en C).
+# On peut le creer dans Photoshop/Lightroom/DaVinci..., l'exporter en .cube (LUT 3D) et le charger dans l'appli.
+LOOK_NONE = "Aucun"
+LOOK_GRID = 33
+
+
+def parse_cube(data: bytes):
+    """Lit un fichier .cube (LUT 3D) et renvoie un ImageFilter.Color3DLUT. Leve ValueError si invalide."""
+    size = None
+    rows = []
+    for raw in data.decode("utf-8", "ignore").splitlines():
+        line = raw.strip()
+        if not line or line.startswith("#"):
+            continue
+        up = line.upper()
+        if up.startswith("LUT_1D_SIZE"):
+            raise ValueError("c'est une LUT 1D : exportez une LUT 3D (.cube)")
+        if up.startswith("LUT_3D_SIZE"):
+            size = int(line.split()[1])
+            continue
+        parts = line.split()
+        if len(parts) == 3:
+            try:
+                rows.append([float(x) for x in parts])
+            except ValueError:
+                continue  # lignes d'en-tete (TITLE, DOMAIN_MIN...) ignorees
+    if not size or size < 2 or size > 129:
+        raise ValueError("taille de LUT 3D introuvable ou invalide")
+    if len(rows) != size ** 3:
+        raise ValueError(f"nombre de valeurs incorrect ({len(rows)} au lieu de {size ** 3})")
+    table = np.clip(np.array(rows, dtype=np.float32), 0.0, 1.0)
+    return ImageFilter.Color3DLUT(size, table.flatten().tolist())
+
+
+def _lut_from_function(fn, size=LOOK_GRID):
+    """Construit une LUT 3D a partir d'une fonction vectorisee (N,3) -> (N,3), valeurs 0-1."""
+    g = np.linspace(0.0, 1.0, size, dtype=np.float32)
+    b_, g_, r_ = np.meshgrid(g, g, g, indexing="ij")          # le rouge varie le plus vite, comme .cube
+    rgb = np.stack([r_, g_, b_], axis=-1).reshape(-1, 3)
+    out = np.clip(fn(rgb), 0.0, 1.0).astype(np.float32)
+    return ImageFilter.Color3DLUT(size, out.flatten().tolist())
+
+
+def _luma3(c):
+    return (c[:, 0] * 0.299 + c[:, 1] * 0.587 + c[:, 2] * 0.114)[:, None]
+
+
+def _saturate(c, factor):
+    y = _luma3(c)
+    return y + (c - y) * factor
+
+
+def _s_curve(c, k):
+    """Courbe en S (k>0 : plus de contraste, k<0 : plus doux), neutre aux extremes."""
+    smooth = c * c * (3.0 - 2.0 * c)
+    return c + k * (smooth - c)
+
+
+def _look_eclat(c):
+    return _saturate(_s_curve(c, 0.45), 1.22)
+
+
+def _look_cinema(c):
+    y = _luma3(c)
+    out = _s_curve(c, 0.55)
+    out = out + (1.0 - y) * np.array([-0.020, 0.012, 0.035], dtype=np.float32)   # ombres un peu bleutees
+    out = out + y * np.array([0.035, 0.012, -0.030], dtype=np.float32)           # hautes lumieres chaudes
+    return _saturate(out, 0.96)
+
+
+def _look_doux(c):
+    out = _s_curve(c, -0.25)                      # moins de contraste
+    out = 0.04 + out * 0.94                       # noirs legerement releves, blancs retenus
+    out = out + _luma3(c) * np.array([0.015, 0.005, -0.010], dtype=np.float32)   # chaleur discrete
+    return _saturate(out, 1.05)
+
+
+def _look_contraste(c):
+    return _saturate(_s_curve(c, 0.85), 1.10)
+
+
+BUILTIN_LOOK_FUNCTIONS = {
+    "Éclat (couleurs vives)": _look_eclat,
+    "Cinéma (ombres bleutées, lumières chaudes)": _look_cinema,
+    "Doux lumineux (peau flatteuse)": _look_doux,
+    "Contraste fort": _look_contraste,
+}
+BUILTIN_LOOK_NAMES = list(BUILTIN_LOOK_FUNCTIONS)
+_builtin_cache = {}
+
+
+def builtin_look(name):
+    """LUT integree (calculee une seule fois), ou None."""
+    fn = BUILTIN_LOOK_FUNCTIONS.get(name)
+    if fn is None:
+        return None
+    if name not in _builtin_cache:
+        _builtin_cache[name] = _lut_from_function(fn)
+    return _builtin_cache[name]
+
+
+def lift_shadows(img, amount):
+    """Deboucher les ombres (amount 0-100) : utile quand la lumiere vient d'un seul cote."""
+    a = max(0.0, min(float(amount), 100.0)) / 100.0
+    if a <= 0:
+        return img
+    x = np.arange(256, dtype=np.float32) / 255.0
+    lut = (x + a * 1.1 * x * (1.0 - x) ** 2).clip(0, 1)
+    table = (lut * 255.0).round().astype("uint8").tolist()
+    return img.convert("RGB").point(table * 3)
+
+
+def skin_mask(img):
+    """Masque doux (0-1) des zones de teinte 'peau' : repere par la couleur, sans detection de visage."""
+    ycc = np.asarray(img.convert("YCbCr"), dtype=np.float32)
+    y, cb, cr = ycc[..., 0], ycc[..., 1], ycc[..., 2]
+    mask = ((cb >= 77) & (cb <= 127) & (cr >= 133) & (cr <= 170) & (y > 45)).astype("uint8") * 255
+    side = min(img.size)
+    soft = Image.fromarray(mask).filter(ImageFilter.GaussianBlur(max(2.0, side / 90.0)))
+    return np.asarray(soft, dtype=np.float32) / 255.0
+
+
+def smooth_skin(img, amount):
+    """
+    Lissage LEGER de la peau (amount 0-100) : attenue les petits details (grain, imperfections)
+    uniquement dans les zones de teinte peau, en gardant les contours nets (yeux, levres, cheveux).
+    """
+    a = max(0.0, min(float(amount), 100.0)) / 100.0
+    if a <= 0:
+        return img
+    img = img.convert("RGB")
+    side = min(img.size)
+    base = np.asarray(img, dtype=np.float32)
+    low = np.asarray(img.filter(ImageFilter.GaussianBlur(max(1.5, side / 250.0))), dtype=np.float32)
+    detail = base - low
+    mag = np.abs(detail).mean(axis=2, keepdims=True)
+    keep_edges = np.exp(-((mag / 9.0) ** 2))               # 1 = petit detail (a lisser), 0 = contour fort (a garder)
+    smoothed = low + detail * (1.0 - 0.75 * a * keep_edges)
+    m = skin_mask(img)[..., None]
+    out = base * (1.0 - m) + smoothed * m
+    return Image.fromarray(out.clip(0, 255).astype("uint8"))
+
+
+def extras_active(extras):
+    if not extras:
+        return False
+    return bool(
+        extras.get("shadows", 0) > 0
+        or extras.get("skin", 0) > 0
+        or (extras.get("look") is not None and extras.get("look_strength", 1.0) > 0)
+    )
+
+
+def apply_extras(img, extras):
+    """Ombres deboucheees puis look, avec intensite reglable. `extras` : dict ou None."""
+    if not extras_active(extras):
+        return img
+    img = img.convert("RGB")
+    if extras.get("shadows", 0) > 0:
+        img = lift_shadows(img, extras["shadows"])
+    if extras.get("skin", 0) > 0:
+        img = smooth_skin(img, extras["skin"])
+    look = extras.get("look")
+    strength = float(extras.get("look_strength", 1.0))
+    if look is not None and strength > 0:
+        graded = img.filter(look)
+        img = graded if strength >= 1.0 else Image.blend(img, graded, strength)
+    return img
+
+
 def _hue_in_range(hue_deg, start, end):
     if start <= end:
         return (hue_deg >= start) & (hue_deg <= end)
@@ -183,14 +356,17 @@ def apply_filter(
     temperature=DEFAULT_TEMPERATURE,
     tint=DEFAULT_TINT,
     enhance=None,
+    extras=None,
 ):
     """
     Retourne une copie reglee puis filtree de l'image PIL (RGB). Ne modifie pas l'original.
     `enhance` : reglages d'amelioration automatique (enhance_params) ou None.
+    `extras` : ombres deboucheees + look (voir apply_extras) ou None.
     """
     if enhance:
         img = auto_enhance(img, enhance)
     img = adjust_image(img, brightness, contrast, temperature, tint)
+    img = apply_extras(img, extras)
     if filter_name == FILTER_BW:
         return img.convert("L").convert("RGB")
     if filter_name == FILTER_SEPIA:
@@ -232,10 +408,12 @@ def apply_filter_to_files(
     temperature=DEFAULT_TEMPERATURE,
     tint=DEFAULT_TINT,
     auto_enhance_on=False,
+    extras=None,
 ):
     """Cree des COPIES reglees/filtrees dans un dossier temporaire et renvoie leurs chemins."""
     if (
         not auto_enhance_on
+        and not extras_active(extras)
         and filter_name == FILTER_NONE
         and not brightness and not contrast
         and not temperature and not tint
@@ -248,7 +426,7 @@ def apply_filter_to_files(
         with Image.open(path) as im:
             res = apply_filter(
                 im, filter_name, keep_colors, sat_min, brightness, contrast, temperature, tint,
-                enhance=params,
+                enhance=params, extras=extras,
             )
         fp = join(out_dir, f"filtered_{i}.jpg")
         res.save(fp, quality=95)
@@ -272,12 +450,14 @@ def create_clip(
     tint: int = DEFAULT_TINT,
     auto_enhance_on: bool = False,
     reverse: bool = False,
+    extras: dict = None,
+    multiply: int = 0,
 ):
     center_crop_to_square(image_paths)
     # Reglages et filtre appliques sur des copies (les photos d'origine restent intactes)
     image_paths = apply_filter_to_files(
         image_paths, filter_name, keep_colors, sat_min, brightness, contrast, temperature, tint,
-        auto_enhance_on=auto_enhance_on,
+        auto_enhance_on=auto_enhance_on, extras=extras,
     )
     # Load audio
     audio = AudioFileClip(audio_path)
@@ -299,14 +479,49 @@ def create_clip(
         top = np.hstack([a, np.rot90(a, 3)])
         bottom = np.hstack([np.rot90(a, 1), np.rot90(a, 2)])
         tiles.append(np.ascontiguousarray(np.vstack([top, bottom])))
+    # Demultiplication progressive : la video demarre en x4 (la photo 4 fois dans le carre, comme
+    # d'habitude) puis le kaleidoscope est lui-meme repete : x16, puis x64 si demande.
+    # La taille de la video ne change pas : les carres deviennent simplement plus petits.
+    levels = [tiles]
+    if multiply and multiply >= 16:
+        side = (tiles[0].shape[0] // 8) * 8  # multiple de 8 pour que les repetitions tombent juste
+        base = [np.array(Image.fromarray(t).resize((side, side), Image.LANCZOS)) for t in tiles]
+        levels = [base]
+        for grid in ((2, 4) if multiply >= 64 else (2,)):
+            small = [
+                np.ascontiguousarray(np.tile(
+                    np.array(Image.fromarray(t).resize((side // grid, side // grid), Image.LANCZOS)),
+                    (grid, grid, 1),
+                ))
+                for t in base
+            ]
+            levels.append(small)
     if reverse:
         # Montage a l'envers : derniere photo prise en premier. On garde un nombre ENTIER de
         # passages pour que la video commence sur la derniere photo et se termine sur la premiere.
-        tiles = tiles[::-1]
-        if nb_frames >= len(tiles):
-            nb_frames = (nb_frames // len(tiles)) * len(tiles)
-    frames = [tiles[i % len(tiles)] for i in range(nb_frames)]
-    clip = ImageSequenceClip(frames, fps=fps)
+        levels = [lvl[::-1] for lvl in levels]
+        if nb_frames >= len(levels[0]):
+            nb_frames = (nb_frames // len(levels[0])) * len(levels[0])
+    n = len(levels[0])
+    nb_stages = len(levels)
+    # Fin de chaque etape : parts egales, arrondies a un passage complet de la serie si possible
+    ends = []
+    for k in range(1, nb_stages + 1):
+        e = nb_frames * k / nb_stages
+        if nb_frames >= n * nb_stages:
+            e = round(e / n) * n
+        ends.append(int(round(e)))
+    ends[-1] = nb_frames
+    frames = []
+    stage = 0
+    for i in range(nb_frames):
+        while stage < nb_stages - 1 and i >= ends[stage]:
+            stage += 1
+        frames.append(levels[stage][i % n])
+    # Image par numero exact : ImageSequenceClip arrondit parfois vers le bas (2,4 s x 5 = 11,999...)
+    # ce qui doublait une photo et en sautait une autre (et pouvait manquer la derniere image).
+    nb_total = len(frames)
+    clip = VideoClip(lambda t: frames[min(int(round(t * fps)), nb_total - 1)], duration=nb_total / fps)
     if reverse:
         audio = audio.with_duration(clip.duration)  # la musique s'arrete avec la derniere image
     # Attacher l'audio sauf en mode muet (rythme et duree restent calcules sur l'audio)
