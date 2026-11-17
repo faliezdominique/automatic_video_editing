@@ -12,6 +12,7 @@ from datetime import datetime
 from collections import defaultdict
 from os.path import join, splitext, split
 
+import numpy as np
 import qrcode
 import streamlit as st
 from streamlit import session_state
@@ -61,7 +62,7 @@ def main():
     video_section()
     display_history()
     library_section()
-    st.caption("Version du 17/11/2026 — 17h55")
+    st.caption("Version du 17/11/2026 — 18h15")
     # Espace en bas de page : le gros bouton fixe ne masque pas le contenu
     st.markdown('<div style="height: 180px"></div>', unsafe_allow_html=True)
 
@@ -223,6 +224,8 @@ def settings_section():
             session_state.keep_colors = []
             session_state.sat_min = video_editing.DEFAULT_SAT_MIN
 
+        overlay_section()
+
         # Poste de reglage : on choisit une photo de reference, on regle, et c'est applique a toute la serie
         st.markdown("**Aperçu des réglages** (appliqués à toutes les photos cochées)")
         paths = selected_paths()
@@ -289,6 +292,135 @@ def settings_section():
             key="btn_pos",
         )
 
+
+
+# ---------------------------------------------------------------------------
+# Calque : logo / phrase du client (PNG transparent) pose sur le carre final de la video
+# ---------------------------------------------------------------------------
+OVERLAY_PREFIX = "calques/"
+MAX_OVERLAY_MB = 8
+
+
+def fetch_overlay_list():
+    """{nom: cle} des calques PNG du bucket, ou None si Scaleway est injoignable."""
+    try:
+        client, bucket = music_client(), st.secrets["BUCKET_NAME"]
+        found = {}
+        for page in client.get_paginator("list_objects_v2").paginate(Bucket=bucket, Prefix=OVERLAY_PREFIX):
+            for obj in page.get("Contents", []):
+                name = obj["Key"][len(OVERLAY_PREFIX):]
+                if name.lower().endswith(".png"):
+                    found[splitext(name)[0]] = obj["Key"]
+        session_state.overlay_error = ""
+        return dict(sorted(found.items()))
+    except Exception as exc:
+        session_state.overlay_error = f"{type(exc).__name__}: {str(exc)[:200]}"
+        return None
+
+
+@st.cache_data(show_spinner=False, max_entries=10)
+def fetch_overlay_bytes(key: str) -> bytes:
+    return music_client().get_object(Bucket=st.secrets["BUCKET_NAME"], Key=key)["Body"].read()
+
+
+def overlay_preview(overlay_bytes: bytes):
+    """Apercu du carre final : derniere photo en kaleidoscope (ou fond gris) + calque."""
+    side = 300
+    paths = selected_paths()
+    if paths:
+        with Image.open(paths[-1]) as im:
+            im = im.convert("RGB")
+            w, h = im.size
+            m = min(w, h)
+            im = im.crop(((w - m) // 2, (h - m) // 2, (w - m) // 2 + m, (h - m) // 2 + m)).resize((side, side))
+            base = video_editing.make_tile(np.array(im))
+    else:
+        base = np.full((side * 2, side * 2, 3), 128, dtype=np.uint8)
+    ov = video_editing.load_overlay(overlay_bytes, base.shape[0])
+    return video_editing.blend_overlay(base, ov)
+
+
+def overlay_section():
+    """Choix du calque, ajout/suppression de calques PNG. Renseigne session_state.overlay_bytes."""
+    st.markdown("**Calque : logo ou phrase du client**")
+    if "overlay_list" not in session_state:
+        session_state.overlay_list = fetch_overlay_list()
+    saved = session_state.overlay_list or {}
+    mine = {f"📁 {name}": key for name, key in saved.items()}
+    options = ["Aucun"] + list(mine)
+    choice = st.selectbox("Calque posé sur la vidéo (PNG transparent)", options, key="overlay_select")
+    one_off = st.file_uploader(
+        "…ou envoyer un PNG pour cette soirée seulement",
+        type=["png"], key=f"overlay_oneoff_{session_state.get('overlay_oneoff_key', 0)}",
+    )
+    data = None
+    if one_off is not None:
+        data = one_off.getvalue()
+    elif choice in mine:
+        try:
+            data = fetch_overlay_bytes(mine[choice])
+        except Exception as exc:
+            st.warning(f"Ce calque ne peut pas être lu : {type(exc).__name__}")
+    if data is not None:
+        try:
+            with Image.open(BytesIO(data)) as im:
+                im.load()
+            st.image(overlay_preview(data), caption="Aperçu du carré final (la photo est celle de la dernière prise)", width=300)
+        except Exception:
+            st.warning("Ce fichier n'est pas une image PNG lisible : il sera ignoré.")
+            data = None
+    session_state.overlay_bytes = data
+    st.caption(
+        "Le calque est posé sur le carré final entier (pas sur chaque petit carré). "
+        "Préparez un PNG carré à fond transparent ; un calque non carré est centré sans déformation."
+    )
+
+    if st.checkbox("➕ Ajouter ou supprimer mes calques", key="overlay_manage_toggle"):
+        if session_state.overlay_list is None:
+            st.caption(f"Liste de vos calques indisponible (connexion ou droits Scaleway ?) {session_state.get('overlay_error', '')}")
+        files = st.file_uploader(
+            "Fichiers PNG à enregistrer", type=["png"], accept_multiple_files=True,
+            key=f"overlay_add_{session_state.get('overlay_add_key', 0)}",
+        )
+        if files and st.button("Enregistrer ces calques", key="overlay_save"):
+            done, problems = 0, []
+            for f in files:
+                try:
+                    if len(f.getvalue()) > MAX_OVERLAY_MB * 1024 * 1024:
+                        raise ValueError(f"fichier trop lourd (plus de {MAX_OVERLAY_MB} Mo)")
+                    with Image.open(BytesIO(f.getvalue())) as im:
+                        im.load()
+                    music_client().put_object(
+                        Bucket=st.secrets["BUCKET_NAME"],
+                        Key=f"{OVERLAY_PREFIX}{clean_file_name(splitext(f.name)[0])}.png",
+                        Body=f.getvalue(),
+                        ContentType="image/png",
+                    )
+                    done += 1
+                except ValueError as exc:
+                    problems.append(f"{f.name} : {exc}")
+                except Exception as exc:
+                    problems.append(f"{f.name} : enregistrement impossible ({type(exc).__name__})")
+            fetch_overlay_bytes.clear()
+            session_state.overlay_add_key = session_state.get("overlay_add_key", 0) + 1
+            session_state.overlay_list = fetch_overlay_list()
+            if done:
+                st.toast(f"{done} calque(s) enregistré(s) ✓")
+            if problems:
+                st.error("Non enregistrés : " + " ; ".join(problems))
+            else:
+                st.rerun()
+        if saved:
+            victim = st.selectbox("Calque à supprimer", list(saved), key="overlay_del_choice")
+            if st.button("Supprimer ce calque définitivement", key="overlay_delete"):
+                try:
+                    music_client().delete_object(Bucket=st.secrets["BUCKET_NAME"], Key=saved[victim])
+                    fetch_overlay_bytes.clear()
+                    session_state.overlay_list = fetch_overlay_list()
+                    st.toast(f"« {victim} » supprimé ✓")
+                    st.rerun()
+                except Exception as exc:
+                    st.error(f"Suppression impossible : {type(exc).__name__}: {str(exc)[:160]}")
 
 
 # ---------------------------------------------------------------------------
@@ -1340,6 +1472,7 @@ def create_new_clips():
             extras=session_state.extras,
             reverse=session_state.get("reverse_video", False),
             multiply=(session_state.get("multiply_max", 16) if session_state.get("multiply_video", False) else 0),
+            overlay_bytes=session_state.get("overlay_bytes"),
             filter_name=session_state.filter_name,
             keep_colors=session_state.keep_colors,
             sat_min=session_state.sat_min,
@@ -1399,6 +1532,7 @@ def create_clip(
     reverse: bool = False,
     extras: dict = None,
     multiply: int = 0,
+    overlay_bytes: bytes = None,
 ) -> tuple[str, float]:
     """
     ### Description:
@@ -1425,6 +1559,11 @@ def create_clip(
         with Image.open(path) as src:
             src.convert("RGB").save(copy_path, quality=97)
         work_paths.append(copy_path)
+    overlay_path = None
+    if overlay_bytes:
+        overlay_path = os.path.join(work_dir, "calque.png")
+        with open(overlay_path, "wb") as fh:
+            fh.write(overlay_bytes)
     with tempfile.NamedTemporaryFile(suffix=audio_ext) as audio_file:
         audio_file.write(track["file"].getbuffer())
         video_editing.create_clip(
@@ -1445,6 +1584,7 @@ def create_clip(
             reverse=reverse,
             extras=extras,
             multiply=multiply,
+            overlay_path=overlay_path,
         )
         return video_filename, track["duration"]
 
