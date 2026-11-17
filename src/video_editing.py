@@ -480,7 +480,7 @@ def create_clip(
         bottom = np.hstack([np.rot90(a, 1), np.rot90(a, 2)])
         tiles.append(np.ascontiguousarray(np.vstack([top, bottom])))
     # Demultiplication progressive : la video demarre en x4 (la photo 4 fois dans le carre, comme
-    # d'habitude) puis le kaleidoscope est lui-meme repete : x16, puis x64 si demande.
+    # d'habitude) puis le kaleidoscope est lui-meme repete : x16, puis x64 si demande, et on revient en x4.
     # La taille de la video ne change pas : les carres deviennent simplement plus petits.
     levels = [tiles]
     if multiply and multiply >= 16:
@@ -503,21 +503,23 @@ def create_clip(
         if nb_frames >= len(levels[0]):
             nb_frames = (nb_frames // len(levels[0])) * len(levels[0])
     n = len(levels[0])
-    nb_stages = len(levels)
-    # Fin de chaque etape : parts egales, arrondies a un passage complet de la serie si possible
+    # Aller-retour : x4 -> x16 (-> x64) puis retour x16 -> x4. Sans demultiplication : un seul niveau.
+    order = list(range(len(levels))) + list(range(len(levels) - 2, -1, -1))
+    nb_stages = len(order)
+    # Duree relative de chaque etape, d'apres la video de reference (32 s : x4 8 s, x16 8 s, x64 4 s,
+    # x16 4 s, x4 8 s). Pour un aller-retour jusqu'a x16 : 1 / 2 / 1.
+    weights = {1: [1], 3: [1, 2, 1], 5: [2, 2, 1, 1, 2]}[nb_stages]
+    # Fin de chaque etape (duree exacte, pour tomber sur les temps de la musique)
     ends = []
     for k in range(1, nb_stages + 1):
-        e = nb_frames * k / nb_stages
-        if nb_frames >= n * nb_stages:
-            e = round(e / n) * n
-        ends.append(int(round(e)))
+        ends.append(int(round(nb_frames * sum(weights[:k]) / sum(weights))))
     ends[-1] = nb_frames
     frames = []
     stage = 0
     for i in range(nb_frames):
         while stage < nb_stages - 1 and i >= ends[stage]:
             stage += 1
-        frames.append(levels[stage][i % n])
+        frames.append(levels[order[stage]][i % n])
     # Image par numero exact : ImageSequenceClip arrondit parfois vers le bas (2,4 s x 5 = 11,999...)
     # ce qui doublait une photo et en sautait une autre (et pouvait manquer la derniere image).
     nb_total = len(frames)
