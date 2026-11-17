@@ -61,7 +61,7 @@ def main():
     video_section()
     display_history()
     library_section()
-    st.caption("Version du 17/11/2026 — 17h30")
+    st.caption("Version du 17/11/2026 — 17h55")
     # Espace en bas de page : le gros bouton fixe ne masque pas le contenu
     st.markdown('<div style="height: 180px"></div>', unsafe_allow_html=True)
 
@@ -1061,13 +1061,14 @@ def video_section():
         value=False,
         key="multiply_cb",
         help="La vidéo commence comme d'habitude (la photo 4 fois dans le carré), puis les carrés "
-             "se multiplient : ×16, puis ×64 si vous le choisissez. La taille de la vidéo ne change pas.",
+             "se multiplient : ×16, puis ×64 si vous le choisissez, et ils reviennent à 4 avant la fin. "
+             "La taille de la vidéo ne change pas.",
     )
     if session_state.multiply_video:
         session_state.multiply_max = st.radio(
             "Aller jusqu'à",
             [16, 64],
-            format_func=lambda v: f"×{v} (4 → 16 carrés)" if v == 16 else f"×{v} (4 → 16 → 64 carrés)",
+            format_func=lambda v: "×16 (4 → 16 → 4 carrés)" if v == 16 else "×64 (4 → 16 → 64 → 16 → 4 carrés)",
             horizontal=True,
             key="multiply_max_radio",
         )
