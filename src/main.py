@@ -66,7 +66,7 @@ def main():
     new_session_section()
     library_section()
     save_state()
-    st.caption("Version du 23/11/2026 — 22h15")
+    st.caption("Version du 23/11/2026 — 22h45")
     # Espace en bas de page : le gros bouton fixe ne masque pas le contenu
     st.markdown('<div style="height: 180px"></div>', unsafe_allow_html=True)
 
@@ -95,6 +95,78 @@ class PersistentDir:
             pass
 
 
+# Reglages retrouves apres une coupure : cle du widget -> liste de choix possibles (None = valeur libre)
+SETTINGS_PLAIN = [
+    "auto_enhance_cb", "brightness_slider", "contrast_slider", "temperature_slider", "tint_slider",
+    "sat_min_slider", "mute_checkbox", "fullscreen_cam", "cam_zoom_front", "cam_zoom_rear",
+    "look_strength", "shadows_slider", "skin_slider", "reverse_cb", "multiply_cb",
+    1, 2,  # BPM et duree de la musique (voir tempo_keys)
+    "last_music_0", "tempo_hint_0",
+]
+SETTINGS_CHOICES_STATIC = {
+    "filter_select": lambda: list(video_editing.FILTER_NAMES),
+    "btn_pos": lambda: list(BUTTON_POSITIONS),
+    "cam_facing": lambda: ["Selfie (avant)", "Arrière"],
+    "multiply_max_radio": lambda: [16, 64],
+    "spin_back_radio_2": lambda: ["Aucune", "Pendant le ×16"],
+    "spin_back_radio_3": lambda: ["Aucune", "Pendant la redescente ×16", "Pendant le pic ×64"],
+    "bars_0": lambda: list(BAR_CHOICES),
+}
+SETTINGS_CHOICES_DYNAMIC = ["music_choice", "overlay_select", "look_select"]
+
+
+def settings_snapshot() -> list:
+    out = []
+    keys = SETTINGS_PLAIN + list(SETTINGS_CHOICES_STATIC) + SETTINGS_CHOICES_DYNAMIC
+    keys += [k for k in list(session_state.keys()) if isinstance(k, str) and k.startswith("keep_color_")]
+    for key in keys:
+        try:
+            if key in session_state:
+                value = session_state[key]
+                json.dumps(value)
+                out.append([key, value])
+        except Exception:
+            pass
+    return out
+
+
+def dynamic_options(key: str):
+    """Choix actuellement proposes par les listes dynamiques (None si indisponibles)."""
+    if key == "music_choice":
+        ensure_music_list()
+        return list(session_state.music_list) if session_state.music_list else None
+    if key == "overlay_select":
+        if "overlay_list" not in session_state:
+            session_state.overlay_list = fetch_overlay_list()
+        return ["Aucun"] + [f"📁 {n}" for n in (session_state.overlay_list or {})]
+    if key == "look_select":
+        if "look_list" not in session_state:
+            session_state.look_list = fetch_look_list()
+        return [video_editing.LOOK_NONE] + video_editing.BUILTIN_LOOK_NAMES + [f"📁 {n}" for n in (session_state.look_list or {})]
+    return None
+
+
+def restore_settings(pairs):
+    """Remet les reglages (musique, tempo, look, filtre, calque...) avant l'affichage des widgets."""
+    for key, value in pairs or []:
+        try:
+            if isinstance(key, str) is False and key not in (1, 2):
+                continue
+            if key in SETTINGS_CHOICES_STATIC:
+                if value not in SETTINGS_CHOICES_STATIC[key]():
+                    continue
+            elif key in SETTINGS_CHOICES_DYNAMIC:
+                options = dynamic_options(key)
+                if not options or value not in options:
+                    continue
+            elif key not in SETTINGS_PLAIN and not (isinstance(key, str) and key.startswith("keep_color_")):
+                continue
+            if key not in session_state:
+                session_state[key] = value
+        except Exception:
+            pass
+
+
 def state_snapshot() -> dict:
     return {
         "event_name": session_state.get("event_name", ""),
@@ -108,6 +180,7 @@ def state_snapshot() -> dict:
         "clips": [c for c in session_state.get("clips", []) if os.path.exists(c.get("path", ""))],
         "zipped_clips_s3_url": session_state.get("zipped_clips_s3_url"),
         "save_photos": bool(session_state.get("save_photos_cb", False)),
+        "settings": settings_snapshot(),
     }
 
 
@@ -155,6 +228,7 @@ def restore_state():
     session_state.unchecked = set(data.get("unchecked", []))
     session_state.clips = [c for c in data.get("clips", []) if os.path.exists(c.get("path", ""))]
     session_state.zipped_clips_s3_url = data.get("zipped_clips_s3_url")
+    restore_settings(data.get("settings"))
     if data.get("save_photos") and "save_photos_cb" not in session_state:
         session_state.save_photos_cb = True
     name = data.get("event_name", "")
@@ -181,7 +255,8 @@ def push_remote_state(snap: dict):
             history.append(copy)
         payload = json.dumps(
             {"event_name": snap["event_name"], "history": history, "video_counter": snap["video_counter"],
-             "photo_counter": snap["photo_counter"], "save_photos": snap["save_photos"]},
+             "photo_counter": snap["photo_counter"], "save_photos": snap["save_photos"],
+             "settings": snap["settings"]},
             ensure_ascii=False,
         ).encode("utf-8")
         client, bucket = music_client(), st.secrets["BUCKET_NAME"]
@@ -210,7 +285,7 @@ def save_state():
             os.replace(tmp, STATE_FILE)
             session_state["_saved_text"] = text
         shared = json.dumps(
-            [snap["event_name"], snap["history"], snap["video_counter"]], sort_keys=True, ensure_ascii=False
+            [snap["event_name"], snap["history"], snap["video_counter"], snap["settings"]], sort_keys=True, ensure_ascii=False
         )
         # Jamais d'ecrasement de la copie Scaleway tant qu'on n'a pas pu la lire (reseau coupe au demarrage)
         if session_state.get("_remote_ok") and shared != session_state.get("_saved_remote"):
