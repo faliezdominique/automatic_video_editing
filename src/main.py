@@ -53,6 +53,7 @@ def main():
         pass
     if "tempdir" not in session_state:
         setup_session_state()
+        restore_state()
     ensure_state()
     camera_big = session_state.get("fullscreen_cam", True)
     if not camera_big:
@@ -62,17 +63,210 @@ def main():
     photo_section()
     video_section()
     display_history()
+    new_session_section()
     library_section()
-    st.caption("Version du 23/11/2026 — 14h30")
+    save_state()
+    st.caption("Version du 23/11/2026 — 15h10")
     # Espace en bas de page : le gros bouton fixe ne masque pas le contenu
     st.markdown('<div style="height: 180px"></div>', unsafe_allow_html=True)
+
+
+# ---------------------------------------------------------------------------
+# Memoire de la soiree : survit a un rechargement de la page / a une sortie par erreur
+# ---------------------------------------------------------------------------
+STATE_DIR = join(tempfile.gettempdir(), "kaleido_etat")
+STATE_FILE = join(STATE_DIR, "etat.json")
+STATE_S3_KEY = "etat/courante.json"
+
+
+class PersistentDir:
+    """Dossier des photos : contrairement a un dossier temporaire de session, il survit au rechargement de la page."""
+
+    def __init__(self):
+        self.name = join(STATE_DIR, "photos")
+        os.makedirs(self.name, exist_ok=True)
+        try:  # menage : fichiers de plus de 3 jours
+            limit = datetime.now().timestamp() - 3 * 86400
+            for fname in os.listdir(self.name):
+                path = join(self.name, fname)
+                if os.path.isfile(path) and os.path.getmtime(path) < limit:
+                    os.remove(path)
+        except OSError:
+            pass
+
+
+def state_snapshot() -> dict:
+    return {
+        "event_name": session_state.get("event_name", ""),
+        "history": session_state.get("history", []),
+        "pending_entry": session_state.get("pending_entry"),
+        "video_counter": session_state.get("video_counter", 0),
+        "photo_counter": session_state.get("photo_counter", 0),
+        "series_key": session_state.get("series_key", 0),
+        "image_paths": [p for p in session_state.get("image_paths", []) if os.path.exists(p)],
+        "unchecked": sorted(session_state.get("unchecked", set())),
+        "clips": [c for c in session_state.get("clips", []) if os.path.exists(c.get("path", ""))],
+        "zipped_clips_s3_url": session_state.get("zipped_clips_s3_url"),
+    }
+
+
+def load_remote_state():
+    """(donnees, ok) : etat de la soiree sauvegarde sur Scaleway (historique seulement). ok=False si injoignable."""
+    try:
+        body = music_client().get_object(Bucket=st.secrets["BUCKET_NAME"], Key=STATE_S3_KEY)["Body"].read()
+        return json.loads(body.decode("utf-8")), True
+    except Exception as exc:
+        code = getattr(exc, "response", {}).get("Error", {}).get("Code", "")
+        return None, code in ("NoSuchKey", "404")
+
+
+def restore_state():
+    """Au demarrage d'une session navigateur : retrouve l'etat enregistre (disque du serveur, sinon Scaleway)."""
+    data, remote_ok = None, False
+    try:
+        with open(STATE_FILE, encoding="utf-8") as fh:
+            data = json.load(fh)
+        remote_ok = True
+    except Exception:
+        data = None
+    if data is None:
+        data, remote_ok = load_remote_state()
+        for entry in (data or {}).get("history", []):
+            thumb_b64 = entry.pop("thumb_b64", None)
+            entry["thumb"] = None
+            if thumb_b64:
+                try:
+                    path = join(session_state.tempdir.name, f"history_restaure_{entry.get('number', 0)}.jpg")
+                    with open(path, "wb") as fh:
+                        fh.write(base64.b64decode(thumb_b64))
+                    entry["thumb"] = path
+                except Exception:
+                    pass
+    session_state["_remote_ok"] = remote_ok
+    if not data:
+        return
+    session_state.history = data.get("history", [])
+    session_state.pending_entry = data.get("pending_entry")
+    session_state.video_counter = int(data.get("video_counter", 0))
+    session_state.photo_counter = int(data.get("photo_counter", 0))
+    session_state.series_key = int(data.get("series_key", 0))
+    session_state.image_paths = [p for p in data.get("image_paths", []) if os.path.exists(p)]
+    session_state.unchecked = set(data.get("unchecked", []))
+    session_state.clips = [c for c in data.get("clips", []) if os.path.exists(c.get("path", ""))]
+    session_state.zipped_clips_s3_url = data.get("zipped_clips_s3_url")
+    name = data.get("event_name", "")
+    try:
+        from_url = st.query_params.get("evenement", "")
+    except Exception:
+        from_url = ""
+    if name and not from_url and "event_name_input" not in session_state:
+        session_state.event_name_input = name
+
+
+def push_remote_state(snap: dict):
+    """Copie l'historique sur Scaleway (en arriere-plan) : il survit meme a un redemarrage du serveur."""
+    import threading
+
+    try:
+        history = []
+        for entry in snap["history"]:
+            copy = dict(entry)
+            thumb = copy.pop("thumb", None)
+            if thumb and os.path.exists(thumb):
+                with open(thumb, "rb") as fh:
+                    copy["thumb_b64"] = base64.b64encode(fh.read()).decode("ascii")
+            history.append(copy)
+        payload = json.dumps(
+            {"event_name": snap["event_name"], "history": history, "video_counter": snap["video_counter"],
+             "photo_counter": snap["photo_counter"]},
+            ensure_ascii=False,
+        ).encode("utf-8")
+        client, bucket = music_client(), st.secrets["BUCKET_NAME"]
+    except Exception:
+        return
+
+    def worker():
+        try:
+            client.put_object(Bucket=bucket, Key=STATE_S3_KEY, Body=payload, ContentType="application/json")
+        except Exception:
+            pass
+
+    threading.Thread(target=worker, daemon=True).start()
+
+
+def save_state():
+    """Fin de chaque affichage : enregistre l'etat sur le disque du serveur (+ l'historique sur Scaleway si change)."""
+    try:
+        snap = state_snapshot()
+        text = json.dumps(snap, ensure_ascii=False)
+        if text != session_state.get("_saved_text"):
+            os.makedirs(STATE_DIR, exist_ok=True)
+            tmp = STATE_FILE + ".tmp"
+            with open(tmp, "w", encoding="utf-8") as fh:
+                fh.write(text)
+            os.replace(tmp, STATE_FILE)
+            session_state["_saved_text"] = text
+        shared = json.dumps(
+            [snap["event_name"], snap["history"], snap["video_counter"]], sort_keys=True, ensure_ascii=False
+        )
+        # Jamais d'ecrasement de la copie Scaleway tant qu'on n'a pas pu la lire (reseau coupe au demarrage)
+        if session_state.get("_remote_ok") and shared != session_state.get("_saved_remote"):
+            session_state["_saved_remote"] = shared
+            push_remote_state(snap)
+    except Exception:
+        pass
+
+
+def start_new_session():
+    """Repart de zero : historique, photos et video affichees sont vides (les videos restent sur Scaleway)."""
+    for clip in session_state.get("clips", []):
+        try:
+            os.remove(clip["path"])
+        except OSError:
+            pass
+    for path in session_state.get("image_paths", []):
+        try:
+            os.remove(path)
+        except OSError:
+            pass
+    for entry in session_state.get("history", []) + ([session_state.pending_entry] if session_state.get("pending_entry") else []):
+        try:
+            if entry.get("thumb"):
+                os.remove(entry["thumb"])
+        except OSError:
+            pass
+    session_state.history = []
+    session_state.pending_entry = None
+    session_state.clips = []
+    session_state.zipped_clips_s3_url = None
+    session_state.image_paths = []
+    session_state.selected_image_paths = []
+    session_state.unchecked = set()
+    session_state.series_key += 1
+    session_state.video_counter = 0
+    session_state.photos_zip = None
+    session_state.new_session_cb = False
+
+
+def new_session_section():
+    """Case a cocher (puis confirmation) pour demarrer une nouvelle session sans rien garder a l'ecran."""
+    if not (session_state.history or session_state.image_paths or session_state.clips or session_state.get("pending_entry")):
+        return
+    st.divider()
+    if st.checkbox("🆕 Commencer une nouvelle session (repartir sans aucune création)", key="new_session_cb"):
+        st.warning(
+            "Ceci vide l'historique de la soirée, les photos et la vidéo affichés ici. "
+            "Rien n'est supprimé sur Scaleway : les liens et QR codes déjà donnés restent valables, "
+            "et les vidéos se retrouvent dans « Retrouver mes séances »."
+        )
+        st.button("Oui, repartir de zéro", type="primary", on_click=start_new_session, key="new_session_go")
 
 
 # ---------------------------------------------------------------------------
 # Etat de la session
 # ---------------------------------------------------------------------------
 def setup_session_state():
-    session_state.tempdir = tempfile.TemporaryDirectory()
+    session_state.tempdir = PersistentDir()
     session_state.image_paths = []
     session_state.selected_image_paths = []
     session_state.mute_video = False
@@ -1560,7 +1754,7 @@ def display_history():
             if entry.get("thumb") and os.path.exists(entry["thumb"]):
                 st.image(entry["thumb"], width=120)
         with text_col:
-            st.markdown(f"**{entry['label']}**  \n{entry['time']}")
+            st.markdown(f"**{entry['label']}**  \n{entry.get('date', '')} {entry['time']}")
             for clip in entry["clips"]:
                 st.markdown(f"[lien]({clip['s3_url']})")
         with qr_col:
@@ -1636,6 +1830,7 @@ def create_new_clips():
     session_state.pending_entry = {
         "label": event or clean_file_name(splitext(session_state.audio_tracks[0]["file"].name)[0]),
         "time": now.strftime("%H:%M:%S"),
+        "date": now.strftime("%d/%m/%Y"),
         "thumb": thumb_path,
         "clips": [dict(c) for c in session_state.clips],
         "number": n,
