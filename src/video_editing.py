@@ -434,10 +434,14 @@ def apply_filter_to_files(
     return filtered
 
 
-def make_tile(a: "np.ndarray") -> "np.ndarray":
-    """Kaleidoscope 2x2 d'une photo (tableau RGB) : photo, rotation 270 / rotation 90, rotation 180."""
-    top = np.hstack([a, np.rot90(a, 3)])
-    bottom = np.hstack([np.rot90(a, 1), np.rot90(a, 2)])
+def make_tile(a: "np.ndarray", shift: int = 0) -> "np.ndarray":
+    """Kaleidoscope 2x2 d'une photo (tableau RGB) : photo, rotation 270 / rotation 90, rotation 180.
+    `shift` : nombre de quarts de tour ajoutes A CHAQUE petit carre, sur place (0 = tuile normale).
+    Attention : tourner la tuile ENTIERE ne change rien (elle est identique apres un quart de tour) ;
+    c'est donc la photo de chaque case qui tourne."""
+    r = [(k + shift) % 4 for k in (0, 3, 1, 2)]  # haut-gauche, haut-droite, bas-gauche, bas-droite
+    top = np.hstack([np.rot90(a, r[0]), np.rot90(a, r[1])])
+    bottom = np.hstack([np.rot90(a, r[2]), np.rot90(a, r[3])])
     return np.ascontiguousarray(np.vstack([top, bottom]))
 
 
@@ -542,7 +546,7 @@ def create_clip(
     n = len(levels[0])
     # Deroulement (duree relative), d'apres la video de reference de 32 s :
     #   photos en rythme (4 s) -> "ca tourne" (4 s) -> x16 (8 s) -> x64 (4 s) -> x16 (4 s) -> x4 (8 s)
-    # "p" = image fixe du niveau, "s" = le carre fait un quart de tour a chaque temps.
+    # "p" = image fixe du niveau, "s" = la photo de chaque petit carre fait un quart de tour sur place a chaque temps.
     # Sans demultiplication : un seul niveau, comme d'habitude.
     if len(levels) == 1:
         plan = [("p", 0, 1)]
@@ -562,7 +566,8 @@ def create_clip(
     def spin_frame(j, k):
         key = (j, k)
         if key not in spin_cache:
-            arr = np.ascontiguousarray(np.rot90(raw0[j], k))
+            half = raw0[j].shape[0] // 2
+            arr = make_tile(raw0[j][:half, :half], k)  # le haut-gauche de la tuile = la photo d'origine
             spin_cache[key] = blend_overlay(arr, ov) if ov is not None else arr
         return spin_cache[key]
 
