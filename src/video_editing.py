@@ -434,6 +434,78 @@ def apply_filter_to_files(
     return filtered
 
 
+def estimate_song_bpm(path: str, max_seconds: int = 90):
+    """Estime le tempo d'une musique (battements par minute), ou None si impossible.
+    Methode simple (numpy seulement) : variation d'energie du son, puis auto-correlation.
+    C'est une PROPOSITION : un tempo a moitie ou double est possible, a verifier a l'oreille."""
+    import subprocess
+
+    try:
+        import imageio_ffmpeg
+
+        ff = imageio_ffmpeg.get_ffmpeg_exe()
+    except Exception:
+        ff = "ffmpeg"
+    sr = 11025
+    try:
+        raw = subprocess.run(
+            [ff, "-v", "error", "-t", str(max_seconds), "-i", path, "-ac", "1", "-ar", str(sr), "-f", "s16le", "-"],
+            capture_output=True, timeout=90,
+        ).stdout
+    except Exception:
+        return None
+    x = np.frombuffer(raw, dtype=np.int16).astype(np.float32) / 32768.0
+    if len(x) < sr * 8:
+        return None
+    n_fft, hop = 1024, 128
+    n_frames = 1 + (len(x) - n_fft) // hop
+    win = np.hanning(n_fft).astype(np.float32)
+    shape = (n_frames, n_fft)
+    strides = (x.strides[0] * hop, x.strides[0])
+    frames_view = np.lib.stride_tricks.as_strided(x, shape=shape, strides=strides, writeable=False)
+    mag = np.log1p(10.0 * np.abs(np.fft.rfft(frames_view * win, axis=1)))
+    flux = np.maximum(mag[1:] - mag[:-1], 0.0).sum(axis=1)
+    flux = flux - np.convolve(flux, np.ones(43) / 43, mode="same")  # retire la moyenne locale (~0,5 s)
+    flux = np.maximum(flux, 0.0)
+    if flux.std() < 1e-6:
+        return None
+    n = len(flux)
+    f = np.fft.rfft(flux - flux.mean(), 2 * n)
+    ac = np.fft.irfft(np.abs(f) ** 2)[:n]
+    ac = ac / (ac[0] + 1e-9) * (n / np.maximum(n - np.arange(n), 1))  # correction du nombre de points
+    fps = sr / hop
+    best, best_score = None, -1.0
+    for bpm10 in range(600, 2201):  # 60.0 a 220.0 BPM par pas de 0,1
+        bpm = bpm10 / 10.0
+        lag = 60.0 * fps / bpm
+        li = int(lag)
+        if 2 * li + 2 >= n:
+            continue
+        # valeur interpolee a lag, plus un soutien aux multiples (2 et 4 temps)
+        def at(l):
+            i = int(l)
+            fr = l - i
+            return ac[i] * (1 - fr) + ac[i + 1] * fr
+        score = at(lag) + 0.5 * at(2 * lag) + 0.25 * at(4 * lag if 4 * li + 2 < n else 2 * lag)
+        score *= np.exp(-0.5 * (np.log2(bpm / 120.0) / 0.9) ** 2)  # prefere les tempos usuels
+        if score > best_score:
+            best, best_score = bpm, score
+    return best
+
+
+def propose_song_bpm(raw_bpm):
+    """Ramene un tempo estime dans la plage 85-170 (un tempo a moitie ou double est la confusion
+    la plus frequente) et l'arrondit. A verifier a l'oreille."""
+    if not raw_bpm:
+        return None
+    b = float(raw_bpm)
+    while b < 85:
+        b *= 2
+    while b >= 170:
+        b /= 2
+    return int(round(b))
+
+
 def make_tile(a: "np.ndarray", shift: int = 0) -> "np.ndarray":
     """Kaleidoscope 2x2 d'une photo (tableau RGB) : photo, rotation 270 / rotation 90, rotation 180.
     `shift` : nombre de quarts de tour ajoutes A CHAQUE petit carre, sur place (0 = tuile normale).
@@ -488,6 +560,7 @@ def create_clip(
     extras: dict = None,
     multiply: int = 0,
     overlay_path: str = None,
+    spin_back: str = "",
 ):
     center_crop_to_square(image_paths)
     # Reglages et filtre appliques sur des copies (les photos d'origine restent intactes)
@@ -552,8 +625,14 @@ def create_clip(
         plan = [("p", 0, 1)]
     elif len(levels) == 2:
         plan = [("p", 0, 1), ("s", 0, 1), ("p", 1, 4), ("p", 0, 2)]
+        if spin_back:  # la rotation revient pendant le x16
+            plan[2] = ("s", 1, 4)
     else:
         plan = [("p", 0, 1), ("s", 0, 1), ("p", 1, 2), ("p", 2, 1), ("p", 1, 1), ("p", 0, 2)]
+        if spin_back == "peak":  # la rotation revient pendant le pic x64
+            plan[3] = ("s", 2, 1)
+        elif spin_back == "descent":  # ... ou pendant la redescente en x16
+            plan[4] = ("s", 1, 1)
     total_w = sum(w for _, _, w in plan)
     # Fin de chaque etape (duree exacte, pour tomber sur les temps de la musique)
     ends, acc = [], 0
@@ -561,15 +640,17 @@ def create_clip(
         acc += w
         ends.append(int(round(nb_frames * acc / total_w)))
     ends[-1] = nb_frames
-    spin_cache = {}
 
-    def spin_frame(j, k):
-        key = (j, k)
-        if key not in spin_cache:
-            half = raw0[j].shape[0] // 2
-            arr = make_tile(raw0[j][:half, :half], k)  # le haut-gauche de la tuile = la photo d'origine
-            spin_cache[key] = blend_overlay(arr, ov) if ov is not None else arr
-        return spin_cache[key]
+    def build_spin(j, k, lvl):
+        """Image calculee a la demande (rien n'est garde en memoire) : photo j, k quarts de tour par case."""
+        half = raw0[j].shape[0] // 2
+        tile = make_tile(raw0[j][:half, :half], k)  # le haut-gauche de la tuile = la photo d'origine
+        if lvl > 0:
+            grid = 2 if lvl == 1 else 4
+            side = tile.shape[0]
+            small = np.array(Image.fromarray(tile).resize((side // grid, side // grid), Image.LANCZOS))
+            tile = np.ascontiguousarray(np.tile(small, (grid, grid, 1)))
+        return blend_overlay(tile, ov) if ov is not None else tile
 
     frames = []
     stage, stage_start = 0, 0
@@ -579,13 +660,17 @@ def create_clip(
             stage_start = i
         kind, lvl, _ = plan[stage]
         if kind == "s":
-            frames.append(spin_frame(i % n, (i - stage_start + 1) % 4))
+            frames.append((i % n, (i - stage_start + 1) % 4, lvl))
         else:
             frames.append(levels[lvl][i % n])
     # Image par numero exact : ImageSequenceClip arrondit parfois vers le bas (2,4 s x 5 = 11,999...)
     # ce qui doublait une photo et en sautait une autre (et pouvait manquer la derniere image).
     nb_total = len(frames)
-    clip = VideoClip(lambda t: frames[min(int(round(t * fps)), nb_total - 1)], duration=nb_total / fps)
+    def frame_at(t):
+        e = frames[min(int(round(t * fps)), nb_total - 1)]
+        return build_spin(*e) if isinstance(e, tuple) else e
+
+    clip = VideoClip(frame_at, duration=nb_total / fps)
     if reverse:
         audio = audio.with_duration(clip.duration)  # la musique s'arrete avec la derniere image
     # Attacher l'audio sauf en mode muet (rythme et duree restent calcules sur l'audio)
