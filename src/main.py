@@ -66,7 +66,7 @@ def main():
     new_session_section()
     library_section()
     save_state()
-    st.caption("Version du 23/11/2026 — 15h10")
+    st.caption("Version du 23/11/2026 — 22h15")
     # Espace en bas de page : le gros bouton fixe ne masque pas le contenu
     st.markdown('<div style="height: 180px"></div>', unsafe_allow_html=True)
 
@@ -107,6 +107,7 @@ def state_snapshot() -> dict:
         "unchecked": sorted(session_state.get("unchecked", set())),
         "clips": [c for c in session_state.get("clips", []) if os.path.exists(c.get("path", ""))],
         "zipped_clips_s3_url": session_state.get("zipped_clips_s3_url"),
+        "save_photos": bool(session_state.get("save_photos_cb", False)),
     }
 
 
@@ -154,6 +155,8 @@ def restore_state():
     session_state.unchecked = set(data.get("unchecked", []))
     session_state.clips = [c for c in data.get("clips", []) if os.path.exists(c.get("path", ""))]
     session_state.zipped_clips_s3_url = data.get("zipped_clips_s3_url")
+    if data.get("save_photos") and "save_photos_cb" not in session_state:
+        session_state.save_photos_cb = True
     name = data.get("event_name", "")
     try:
         from_url = st.query_params.get("evenement", "")
@@ -178,7 +181,7 @@ def push_remote_state(snap: dict):
             history.append(copy)
         payload = json.dumps(
             {"event_name": snap["event_name"], "history": history, "video_counter": snap["video_counter"],
-             "photo_counter": snap["photo_counter"]},
+             "photo_counter": snap["photo_counter"], "save_photos": snap["save_photos"]},
             ensure_ascii=False,
         ).encode("utf-8")
         client, bucket = music_client(), st.secrets["BUCKET_NAME"]
@@ -450,7 +453,7 @@ def settings_section():
         # Option : couper le son de la video (le rythme et la duree restent cales sur l'audio)
         session_state.mute_video = st.checkbox("Couper le son de la vidéo", value=False, key="mute_checkbox")
         session_state.save_photos = st.checkbox(
-            "💾 Sauvegarder aussi les photos sur Scaleway (en privé, à côté des vidéos)",
+            "💾 Sauvegarder aussi les photos sur Scaleway (en privé : un zip vidéos + photos par vidéo)",
             value=False,
             key="save_photos_cb",
         )
@@ -806,6 +809,43 @@ def backup_photos_async(paths: list, key_dir: str):
                     )
             except Exception:
                 pass
+
+    threading.Thread(target=worker, daemon=True).start()
+
+
+def complete_zip_async(zip_name: str, key_dir: str, videos: list, photos: list):
+    """
+    Fabrique EN ARRIERE-PLAN un seul zip (videos + photos d'origine), le depose en prive sur Scaleway
+    a cote de la seance, sans bloquer la creation de la video. Les photos ne partent qu'une fois (dans le zip).
+    videos : [(nom, octets)], photos : [chemins]. Echec = silencieux.
+    """
+    import threading
+
+    try:
+        client, bucket = music_client(), st.secrets["BUCKET_NAME"]
+    except Exception:
+        return
+
+    def worker():
+        tmp_path = None
+        try:
+            with tempfile.NamedTemporaryFile(suffix=".zip", delete=False) as tmp:
+                tmp_path = tmp.name
+            with zipfile.ZipFile(tmp_path, "w", zipfile.ZIP_STORED) as zf:
+                for name, data in videos:
+                    zf.writestr(f"{zip_name}/{name}", data)
+                for path in photos:
+                    if os.path.exists(path):
+                        zf.write(path, arcname=f"{zip_name}/photos/{os.path.basename(path)}")
+            client.upload_file(tmp_path, bucket, f"{key_dir}/{zip_name}.zip")
+        except Exception:
+            pass
+        finally:
+            if tmp_path:
+                try:
+                    os.remove(tmp_path)
+                except OSError:
+                    pass
 
     threading.Thread(target=worker, daemon=True).start()
 
@@ -1597,6 +1637,8 @@ def scan_library():
                 entry["photos"].append(key)
             elif rest and rest[-1].lower().endswith(".mp4"):
                 entry["videos"].append(key)
+            elif len(rest) == 1 and rest[0].lower().endswith(".zip"):
+                entry["complete"] = key
     return library
 
 
@@ -1707,24 +1749,45 @@ def library_section():
             st.code(url, language=None)
         if entry["zip"]:
             st.markdown(f"[⬇️ Zip des vidéos de cette séance]({create_s3_key_url(entry['zip'])})")
-        library_download_all(library, event, session_name)
+        complete = entry.get("complete")
+        if complete:
+            try:
+                url = music_client().generate_presigned_url(
+                    "get_object",
+                    Params={"Bucket": st.secrets["BUCKET_NAME"], "Key": complete},
+                    ExpiresIn=3600,
+                )
+                mb = entry["sizes"].get(complete, 0) / 1e6
+                st.link_button(f"⬇️ Dossier complet : vidéos + photos (zip, {mb:.0f} Mo)", url, type="primary")
+                st.caption(f"Fichier : {complete.split('/')[-1]} — téléchargé directement depuis Scaleway, sans passer par l'application. Le lien reste valable 1 h : actualisez la liste pour en obtenir un nouveau.")
+            except Exception:
+                st.caption("Lien du zip complet indisponible pour le moment.")
+        heavy = st.checkbox(
+            "Autres téléchargements (lourds : à faire depuis l'ordinateur, pas la tablette)", key="library_heavy"
+        )
+        if heavy:
+            library_download_all(library, event, session_name)
         if not entry["photos"]:
-            st.caption("Aucune photo sauvegardée pour cette séance (la case « Sauvegarder aussi les photos » n'était pas cochée).")
+            if not complete:
+                st.caption("Aucune photo sauvegardée pour cette séance (la case « Sauvegarder aussi les photos » n'était pas cochée).")
             return
         st.markdown(f"**{len(entry['photos'])} photo(s) sauvegardée(s)**")
         photos = sorted(entry["photos"])
         shown = photos[:12]
-        cols = st.columns(3)
-        for i, key in enumerate(shown):
-            try:
-                with Image.open(BytesIO(fetch_object_bytes(key))) as im:
-                    thumb = im.convert("RGB")
-                    thumb.thumbnail((400, 400))
-                cols[i % 3].image(thumb, use_container_width=True)
-            except Exception:
-                cols[i % 3].caption("(photo illisible)")
-        if len(photos) > len(shown):
-            st.caption(f"+ {len(photos) - len(shown)} autres photos dans le zip.")
+        if st.checkbox("Afficher les miniatures des photos (plus lent)", key="library_thumbs"):
+            cols = st.columns(3)
+            for i, key in enumerate(shown):
+                try:
+                    with Image.open(BytesIO(fetch_object_bytes(key))) as im:
+                        thumb = im.convert("RGB")
+                        thumb.thumbnail((400, 400))
+                    cols[i % 3].image(thumb, use_container_width=True)
+                except Exception:
+                    cols[i % 3].caption("(photo illisible)")
+            if len(photos) > len(shown):
+                st.caption(f"+ {len(photos) - len(shown)} autres photos dans le zip.")
+        if not heavy:
+            return
         if st.button("Préparer le zip des photos", key="library_zip_prepare"):
             with st.spinner("Préparation…"):
                 buf = BytesIO()
@@ -1787,8 +1850,6 @@ def create_new_clips():
     key_dir = join(event, datetime_str) if event else datetime_str
     selected = selected_paths()
     session_state.selected_image_paths = selected
-    if session_state.get("save_photos", False):
-        backup_photos_async(photos_to_export(False), key_dir)  # photos d'origine -> Scaleway (prive)
     multiple_tracks = len(session_state.audio_tracks) > 1
     for track in session_state.audio_tracks:
         audio_name = clean_file_name(splitext(track["file"].name)[0])
@@ -1818,6 +1879,19 @@ def create_new_clips():
             "s3_url": s3_url,
             "duration": duration
         })
+    if session_state.get("save_photos", False):
+        # Un zip complet (videos + photos d'origine) fabrique en arriere-plan, depose en prive sur Scaleway
+        zip_label = clean_file_name(
+            f"{event or clean_file_name(splitext(session_state.audio_tracks[0]['file'].name)[0])}_"
+            f"{now.strftime('%d-%m-%Y_%Hh%M')}", max_length=80)
+        try:
+            videos_data = []
+            for c in session_state.clips:
+                with open(c["path"], "rb") as fh:
+                    videos_data.append((os.path.basename(c["path"]), fh.read()))
+            complete_zip_async(zip_label, key_dir, videos_data, photos_to_export(True))
+        except Exception:
+            pass
     zipped_clips_path = zip_all_clips(datetime_str)
     zipped_clips_s3_url = upload_file_to_bucket(zipped_clips_path, key_dir + ".zip")
     session_state.zipped_clips_s3_url = zipped_clips_s3_url
