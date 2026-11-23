@@ -526,35 +526,57 @@ def create_clip(
                 for t in base
             ]
             levels.append(small)
-    if overlay_path:
-        # Calque (logo, phrase...) pose UNE fois par image distincte, sur le carre final entier
-        # (pas sur chacun des petits carres).
-        ov = load_overlay(overlay_path, levels[0][0].shape[0])
-        levels = [[blend_overlay(t, ov) for t in lvl] for lvl in levels]
     if reverse:
         # Montage a l'envers : derniere photo prise en premier. On garde un nombre ENTIER de
         # passages pour que la video commence sur la derniere photo et se termine sur la premiere.
         levels = [lvl[::-1] for lvl in levels]
         if nb_frames >= len(levels[0]):
             nb_frames = (nb_frames // len(levels[0])) * len(levels[0])
+    raw0 = levels[0]  # x4 sans calque : sert aussi a la phase "ca tourne"
+    ov = None
+    if overlay_path:
+        # Calque (logo, phrase...) pose UNE fois par image distincte, sur le carre final entier
+        # (pas sur chacun des petits carres), et il ne tourne pas avec le kaleidoscope.
+        ov = load_overlay(overlay_path, levels[0][0].shape[0])
+        levels = [[blend_overlay(t, ov) for t in lvl] for lvl in levels]
     n = len(levels[0])
-    # Aller-retour : x4 -> x16 (-> x64) puis retour x16 -> x4. Sans demultiplication : un seul niveau.
-    order = list(range(len(levels))) + list(range(len(levels) - 2, -1, -1))
-    nb_stages = len(order)
-    # Duree relative de chaque etape, d'apres la video de reference (32 s : x4 8 s, x16 8 s, x64 4 s,
-    # x16 4 s, x4 8 s). Pour un aller-retour jusqu'a x16 : 1 / 2 / 1.
-    weights = {1: [1], 3: [1, 2, 1], 5: [2, 2, 1, 1, 2]}[nb_stages]
+    # Deroulement (duree relative), d'apres la video de reference de 32 s :
+    #   photos en rythme (4 s) -> "ca tourne" (4 s) -> x16 (8 s) -> x64 (4 s) -> x16 (4 s) -> x4 (8 s)
+    # "p" = image fixe du niveau, "s" = le carre fait un quart de tour a chaque temps.
+    # Sans demultiplication : un seul niveau, comme d'habitude.
+    if len(levels) == 1:
+        plan = [("p", 0, 1)]
+    elif len(levels) == 2:
+        plan = [("p", 0, 1), ("s", 0, 1), ("p", 1, 4), ("p", 0, 2)]
+    else:
+        plan = [("p", 0, 1), ("s", 0, 1), ("p", 1, 2), ("p", 2, 1), ("p", 1, 1), ("p", 0, 2)]
+    total_w = sum(w for _, _, w in plan)
     # Fin de chaque etape (duree exacte, pour tomber sur les temps de la musique)
-    ends = []
-    for k in range(1, nb_stages + 1):
-        ends.append(int(round(nb_frames * sum(weights[:k]) / sum(weights))))
+    ends, acc = [], 0
+    for _, _, w in plan:
+        acc += w
+        ends.append(int(round(nb_frames * acc / total_w)))
     ends[-1] = nb_frames
+    spin_cache = {}
+
+    def spin_frame(j, k):
+        key = (j, k)
+        if key not in spin_cache:
+            arr = np.ascontiguousarray(np.rot90(raw0[j], k))
+            spin_cache[key] = blend_overlay(arr, ov) if ov is not None else arr
+        return spin_cache[key]
+
     frames = []
-    stage = 0
+    stage, stage_start = 0, 0
     for i in range(nb_frames):
-        while stage < nb_stages - 1 and i >= ends[stage]:
+        while stage < len(plan) - 1 and i >= ends[stage]:
             stage += 1
-        frames.append(levels[order[stage]][i % n])
+            stage_start = i
+        kind, lvl, _ = plan[stage]
+        if kind == "s":
+            frames.append(spin_frame(i % n, (i - stage_start + 1) % 4))
+        else:
+            frames.append(levels[lvl][i % n])
     # Image par numero exact : ImageSequenceClip arrondit parfois vers le bas (2,4 s x 5 = 11,999...)
     # ce qui doublait une photo et en sautait une autre (et pouvait manquer la derniere image).
     nb_total = len(frames)
