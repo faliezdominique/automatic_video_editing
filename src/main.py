@@ -62,7 +62,7 @@ def main():
     video_section()
     display_history()
     library_section()
-    st.caption("Version du 21/11/2026 — 17h45")
+    st.caption("Version du 23/11/2026 — 13h15")
     # Espace en bas de page : le gros bouton fixe ne masque pas le contenu
     st.markdown('<div style="height: 180px"></div>', unsafe_allow_html=True)
 
@@ -1192,8 +1192,9 @@ def video_section():
         "🔳 Démultiplier les carrés au fil de la vidéo",
         value=False,
         key="multiply_cb",
-        help="Les photos s'enchaînent d'abord en rythme (comme d'habitude), puis le carré se met à tourner, "
-             "puis les carrés se multiplient : ×16, puis ×64 si vous le choisissez, avant de revenir à 4. "
+        help="Les photos s'enchaînent d'abord en rythme (comme d'habitude), puis la photo de chaque petit carré "
+             "tourne d'un quart de tour à chaque temps, puis les carrés se multiplient : ×16, puis ×64 si vous le "
+             "choisissez, avant de revenir à 4. "
              "Avec 32 s : 4 s de photos, 4 s qui tournent, puis les multiplications. "
              "La taille de la vidéo ne change pas.",
     )
