@@ -1,5 +1,6 @@
 import os
 import re
+import json
 import PIL
 import unicodedata
 from PIL import Image
@@ -62,7 +63,7 @@ def main():
     video_section()
     display_history()
     library_section()
-    st.caption("Version du 23/11/2026 — 13h15")
+    st.caption("Version du 23/11/2026 — 14h30")
     # Espace en bas de page : le gros bouton fixe ne masque pas le contenu
     st.markdown('<div style="height: 180px"></div>', unsafe_allow_html=True)
 
@@ -754,26 +755,142 @@ def music_extras(track: defaultdict, track_idx: int, music):
                 st.error(f"Suppression impossible : {type(exc).__name__}: {str(exc)[:200]}")
 
 
+MUSIC_SETTINGS_KEY = MUSIC_PREFIX + "_reglages.json"
+BAR_CHOICES = [8, 16, 24, 32]
+
+
+@st.cache_data(show_spinner=False, max_entries=40)
+def detect_song_bpm(name: str, size: int, _data: bytes):
+    """Tempo propose pour une musique (None si non detecte). Calcule une seule fois par musique."""
+    with tempfile.NamedTemporaryFile(suffix=splitext(name)[1] or ".mp3") as fh:
+        fh.write(_data)
+        fh.flush()
+        return video_editing.propose_song_bpm(video_editing.estimate_song_bpm(fh.name))
+
+
+def load_music_settings(force: bool = False) -> dict:
+    """{nom de fichier: {"bpm": ..., "mesures": ...}} memorise sur Scaleway (vide si indisponible)."""
+    if force or "music_settings" not in session_state:
+        try:
+            body = music_client().get_object(Bucket=st.secrets["BUCKET_NAME"], Key=MUSIC_SETTINGS_KEY)["Body"].read()
+            data = json.loads(body.decode("utf-8"))
+            session_state.music_settings = data if isinstance(data, dict) else {}
+        except Exception:
+            session_state.music_settings = {}
+    return session_state.music_settings
+
+
+def save_music_setting(name: str, bpm: float, bars: int):
+    settings = dict(load_music_settings(force=True))
+    settings[name] = {"bpm": bpm, "mesures": bars}
+    music_client().put_object(
+        Bucket=st.secrets["BUCKET_NAME"],
+        Key=MUSIC_SETTINGS_KEY,
+        Body=json.dumps(settings, ensure_ascii=False, indent=1).encode("utf-8"),
+        ContentType="application/json",
+    )
+    session_state.music_settings = settings
+
+
+def tempo_keys(track_idx: int):
+    base = track_idx * NB_KEYS_PER_AUDIO_TRACK
+    return base + 1, base + 2, f"bars_{track_idx}"  # bpm, duree, mesures
+
+
+def recompute_duration(track_idx: int):
+    """Duree = nombre de mesures x duree d'une mesure. Le BPM saisi est le DOUBLE du tempo du morceau :
+    une mesure (4 temps du morceau) = 8 images = 480 / BPM secondes."""
+    bpm_key, dur_key, bars_key = tempo_keys(track_idx)
+    try:
+        session_state[dur_key] = round(session_state[bars_key] * 480.0 / session_state[bpm_key], 1)
+    except Exception:
+        pass
+
+
+def propose_tempo(track: defaultdict, track_idx: int):
+    """A chaque nouvelle musique : tempo memorise, sinon tempo detecte (x2). Les champs restent modifiables."""
+    f = track.get("file")
+    music_id = getattr(f, "name", None)
+    bpm_key, dur_key, bars_key = tempo_keys(track_idx)
+    last_key = f"last_music_{track_idx}"
+    if not music_id or session_state.get(last_key) == music_id:
+        return
+    session_state[last_key] = music_id
+    saved = load_music_settings().get(music_id)
+    hint = ""
+    if saved and saved.get("bpm"):
+        bpm, bars = float(saved["bpm"]), int(saved.get("mesures", 16))
+        hint = f"Réglages mémorisés pour cette musique : {bpm:g} BPM, {bars} mesures."
+    else:
+        bars, bpm = 16, None
+        try:
+            data = bytes(f.getbuffer())
+            with st.spinner("Recherche du tempo de la musique…"):
+                song = detect_song_bpm(music_id, len(data), data)
+        except Exception:
+            song = None
+        if song:
+            bpm = float(2 * song)
+            hint = (f"Tempo détecté ≈ {song} BPM, proposé : {bpm:g} (le double). "
+                    "Un tempo à moitié ou double est possible : vérifiez à l'oreille et corrigez si besoin.")
+        else:
+            hint = "Tempo non détecté : réglez le BPM à la main."
+    if bars not in BAR_CHOICES:
+        bars = 16
+    session_state[bars_key] = bars
+    if bpm:
+        session_state[bpm_key] = bpm
+        session_state[dur_key] = round(bars * 480.0 / bpm, 1)
+    session_state[f"tempo_hint_{track_idx}"] = hint
+
+
 def create_audio_track_inputs(track_idx: int, track: defaultdict):
-    spec = [3, 1, 1, 1] if track_idx else [3, 1, 1]
+    spec = [3, 1, 1, 1, 1] if track_idx else [3, 1, 1, 1]
     cols = st.columns(spec)
     with cols[0]:
         music_chooser(track, track_idx)
+    bpm_key, dur_key, bars_key = tempo_keys(track_idx)
+    session_state.setdefault(bars_key, 16)
+    propose_tempo(track, track_idx)
     with cols[1]:
         track["bpm"] = st.number_input(
             "BPM (rythme)",
             min_value=1.0,
-            value=DEFAULT_BPM,
-            key=track_idx * NB_KEYS_PER_AUDIO_TRACK + 1)
+            key=bpm_key,
+            on_change=recompute_duration,
+            args=(track_idx,),
+            **({} if bpm_key in session_state else {"value": DEFAULT_BPM}),
+        )
     with cols[2]:
+        st.selectbox(
+            "Mesures",
+            BAR_CHOICES,
+            key=bars_key,
+            on_change=recompute_duration,
+            args=(track_idx,),
+            help="Longueur de la vidéo en mesures (4 temps du morceau). 16 ou 24 : les changements de phase "
+                 "tombent alors pile sur le début d'une mesure.",
+        )
+    with cols[3]:
         track["duration"] = st.number_input(
             "Durée (s)",
             min_value=1.0,
-            value=DEFAULT_DURATION,
-            key=track_idx * NB_KEYS_PER_AUDIO_TRACK + 2
+            key=dur_key,
+            **({} if dur_key in session_state else {"value": DEFAULT_DURATION}),
         )
+    hint = session_state.get(f"tempo_hint_{track_idx}")
+    if hint:
+        st.caption(hint)
+    f = track.get("file")
+    if f is not None and getattr(f, "name", None):
+        if st.button("💾 Mémoriser ce tempo pour cette musique", key=f"save_tempo_{track_idx}"):
+            try:
+                save_music_setting(f.name, float(track["bpm"]), int(session_state[bars_key]))
+                st.toast("Tempo mémorisé pour cette musique ✓")
+            except Exception as exc:
+                st.error(f"Impossible de mémoriser (droits Scaleway ?) : {type(exc).__name__}")
     if track_idx:
-        with cols[3]:
+        with cols[4]:
             if st.button("Remove track", key=track_idx * NB_KEYS_PER_AUDIO_TRACK + 3):
                 del session_state.audio_tracks[track_idx]
                 st.rerun()
@@ -1206,6 +1323,23 @@ def video_section():
             horizontal=True,
             key="multiply_max_radio",
         )
+    session_state.spin_back = ""
+    if session_state.multiply_video:
+        if session_state.get("multiply_max", 16) == 64:
+            spin_options = ["Aucune", "Pendant la redescente ×16", "Pendant le pic ×64"]
+        else:
+            spin_options = ["Aucune", "Pendant le ×16"]
+        spin_choice = st.radio(
+            "La rotation revient",
+            spin_options,
+            horizontal=True,
+            key=f"spin_back_radio_{len(spin_options)}",
+            help="Les petits carrés refont un quart de tour sur place à chaque temps pendant cette phase.",
+        )
+        if spin_choice.endswith("×64"):
+            session_state.spin_back = "peak"
+        elif spin_choice != "Aucune":
+            session_state.spin_back = "descent"
     create = st.button("🎬 Créer la vidéo", type="primary", disabled=not can_create)
     if create:
         with st.spinner("Création de la vidéo…"):
@@ -1475,6 +1609,7 @@ def create_new_clips():
             reverse=session_state.get("reverse_video", False),
             multiply=(session_state.get("multiply_max", 16) if session_state.get("multiply_video", False) else 0),
             overlay_bytes=session_state.get("overlay_bytes"),
+            spin_back=session_state.get("spin_back", ""),
             filter_name=session_state.filter_name,
             keep_colors=session_state.keep_colors,
             sat_min=session_state.sat_min,
@@ -1535,6 +1670,7 @@ def create_clip(
     extras: dict = None,
     multiply: int = 0,
     overlay_bytes: bytes = None,
+    spin_back: str = "",
 ) -> tuple[str, float]:
     """
     ### Description:
@@ -1587,6 +1723,7 @@ def create_clip(
             extras=extras,
             multiply=multiply,
             overlay_path=overlay_path,
+            spin_back=spin_back,
         )
         return video_filename, track["duration"]
 
