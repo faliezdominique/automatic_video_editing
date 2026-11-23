@@ -66,7 +66,7 @@ def main():
     new_session_section()
     library_section()
     save_state()
-    st.caption("Version du 23/11/2026 — 22h45")
+    st.caption("Version du 23/11/2026 — 23h15")
     # Espace en bas de page : le gros bouton fixe ne masque pas le contenu
     st.markdown('<div style="height: 180px"></div>', unsafe_allow_html=True)
 
@@ -1679,7 +1679,7 @@ def video_section():
 # ---------------------------------------------------------------------------
 # Bibliotheque : retrouver les seances passees (videos + photos) depuis l'application
 # ---------------------------------------------------------------------------
-SESSION_DIR_RE = re.compile(r"^\d{2}-\d{2}-\d{4}:\d{2}-\d{2}-\d{2}$")
+SESSION_DIR_RE = re.compile(r"^(\d{2}-\d{2}-\d{4}:\d{2}-\d{2}-\d{2}|\d{4}-\d{2}-\d{2}_\d{2}-\d{2}-\d{2})$")
 NO_EVENT_LABEL = "(sans nom d'événement)"
 
 
@@ -1718,10 +1718,12 @@ def scan_library():
 
 
 def session_datetime(session_name: str):
-    try:
-        return datetime.strptime(session_name, "%d-%m-%Y:%H-%M-%S")
-    except ValueError:
-        return datetime.min
+    for fmt in ("%Y-%m-%d_%H-%M-%S", "%d-%m-%Y:%H-%M-%S"):  # nouveau classement, puis ancien
+        try:
+            return datetime.strptime(session_name, fmt)
+        except ValueError:
+            pass
+    return datetime.min
 
 
 def session_label(session_name: str, entry: dict) -> str:
@@ -1918,7 +1920,7 @@ def create_new_clips():
             pass
     session_state.clips = []
     now = datetime.now(ZoneInfo("Europe/Paris"))
-    datetime_str = now.strftime("%d-%m-%Y:%H-%M-%S")
+    datetime_str = now.strftime("%Y-%m-%d_%H-%M-%S")
     session_state.video_counter += 1
     n = session_state.video_counter
     event = clean_file_name(session_state.event_name, max_length=40) if session_state.event_name.strip() else ""
@@ -1958,7 +1960,7 @@ def create_new_clips():
         # Un zip complet (videos + photos d'origine) fabrique en arriere-plan, depose en prive sur Scaleway
         zip_label = clean_file_name(
             f"{event or clean_file_name(splitext(session_state.audio_tracks[0]['file'].name)[0])}_"
-            f"{now.strftime('%d-%m-%Y_%Hh%M')}", max_length=80)
+            f"{now.strftime('%Y-%m-%d_%Hh%M')}", max_length=80)
         try:
             videos_data = []
             for c in session_state.clips:
