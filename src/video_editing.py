@@ -285,11 +285,56 @@ def smooth_skin(img, amount):
     return Image.fromarray(out.clip(0, 255).astype("uint8"))
 
 
+def apply_exposure(img, ev):
+    """Exposition en vues (EV), calculee en lumiere lineaire : +1 = deux fois plus de lumiere."""
+    ev = float(ev)
+    if abs(ev) < 1e-3:
+        return img
+    x = np.arange(256, dtype=np.float32) / 255.0
+    lin = np.power(x, 2.2) * (2.0 ** ev)
+    lut = (np.power(np.clip(lin, 0.0, 1.0), 1.0 / 2.2) * 255.0).round().astype("uint8").tolist()
+    return img.convert("RGB").point(lut * 3)
+
+
+def sharpen_like_lightroom(img, amount, radius, detail, masking):
+    """
+    Nettete inspiree de Lightroom (approximation, pas une copie exacte) sur la luminosite seule.
+    amount 0-150 ; radius en pixels pour une photo de 2000 px (adapte a la taille reelle) ;
+    detail 0-100 (bas = halos limites, haut = nettete franche) ; masking 0-100 (haut = seulement les contours).
+    """
+    amount = float(amount)
+    if amount <= 0:
+        return img
+    img = img.convert("RGB")
+    r = max(0.3, float(radius) * max(img.size) / ENHANCE_MAX_SIDE)
+    y, cb, cr = img.convert("YCbCr").split()
+    ya = np.asarray(y, dtype=np.float32)
+    blur_img = y.filter(ImageFilter.GaussianBlur(r))
+    blur = np.asarray(blur_img, dtype=np.float32)
+    diff = ya - blur
+    d = max(0.0, min(float(detail), 100.0)) / 100.0
+    limit = 12.0
+    diff = limit * np.tanh(diff / limit) * (1.0 - d) + diff * d
+    m = max(0.0, min(float(masking), 100.0)) / 100.0
+    if m > 0:
+        gy, gx = np.gradient(blur)
+        g = np.hypot(gx, gy)
+        gn = g / (float(np.percentile(g, 95)) + 1e-3)
+        t = 0.5 * m
+        mask = np.clip((gn - t) / 0.3, 0.0, 1.0)
+    else:
+        mask = 1.0
+    out = np.clip(ya + (amount / 100.0) * diff * mask, 0, 255).astype("uint8")
+    return Image.merge("YCbCr", (Image.fromarray(out), cb, cr)).convert("RGB")
+
+
 def extras_active(extras):
     if not extras:
         return False
     return bool(
-        extras.get("shadows", 0) > 0
+        abs(extras.get("exposure", 0)) > 1e-3
+        or extras.get("sharp_amount", 0) > 0
+        or extras.get("shadows", 0) > 0
         or extras.get("skin", 0) > 0
         or (extras.get("look") is not None and extras.get("look_strength", 1.0) > 0)
     )
@@ -300,6 +345,8 @@ def apply_extras(img, extras):
     if not extras_active(extras):
         return img
     img = img.convert("RGB")
+    if abs(extras.get("exposure", 0)) > 1e-3:
+        img = apply_exposure(img, extras["exposure"])
     if extras.get("shadows", 0) > 0:
         img = lift_shadows(img, extras["shadows"])
     if extras.get("skin", 0) > 0:
@@ -309,6 +356,11 @@ def apply_extras(img, extras):
     if look is not None and strength > 0:
         graded = img.filter(look)
         img = graded if strength >= 1.0 else Image.blend(img, graded, strength)
+    if extras.get("sharp_amount", 0) > 0:
+        img = sharpen_like_lightroom(
+            img, extras["sharp_amount"], extras.get("sharp_radius", 1.0),
+            extras.get("sharp_detail", 25), extras.get("sharp_masking", 0),
+        )
     return img
 
 
