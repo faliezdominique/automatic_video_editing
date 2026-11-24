@@ -66,7 +66,7 @@ def main():
     new_session_section()
     library_section()
     save_state()
-    st.caption("Version du 23/11/2026 — 23h15")
+    st.caption("Version du 24/11/2026 — 10h15")
     # Espace en bas de page : le gros bouton fixe ne masque pas le contenu
     st.markdown('<div style="height: 180px"></div>', unsafe_allow_html=True)
 
@@ -2101,6 +2101,77 @@ def display_video(clip: dict):
         with qrcode_col:
             qr_img = generate_qr_code(clip["s3_url"])
             st.image(qr_img, caption="Scannez pour récupérer la vidéo")
+        email_form(clip)
+
+
+EMAIL_RE = re.compile(r"^[^@\s]+@[^@\s]+\.[^@\s]{2,}$")
+
+
+def mail_configured() -> bool:
+    try:
+        return all(k in st.secrets for k in ("SMTP_HOST", "SMTP_USER", "SMTP_PASSWORD"))
+    except Exception:
+        return False
+
+
+def send_video_email(to_addr: str, url: str, zip_url: str = None) -> None:
+    """Envoie le lien de la video par e-mail (SMTP configure dans les secrets). Leve une exception en cas d'echec."""
+    import smtplib
+    from email.message import EmailMessage
+
+    host = st.secrets["SMTP_HOST"]
+    port = int(st.secrets.get("SMTP_PORT", 465))
+    user, password = st.secrets["SMTP_USER"], st.secrets["SMTP_PASSWORD"]
+    sender = st.secrets.get("SMTP_FROM", user)
+    sender_name = st.secrets.get("SMTP_FROM_NAME", "L'Œil du Plafond")
+    event = session_state.get("event_name", "")
+    msg = EmailMessage()
+    msg["Subject"] = f"Votre vidéo{' – ' + event if event else ''}"
+    msg["From"] = f"{sender_name} <{sender}>"
+    msg["To"] = to_addr
+    lines = [
+        "Bonjour,",
+        "",
+        "Voici le lien vers votre vidéo :",
+        url,
+        "",
+        "Sur un téléphone, ouvrez le lien puis appuyez sur la vidéo pour l'enregistrer dans vos photos.",
+    ]
+    if zip_url and zip_url != url:
+        lines += ["", "Toutes les vidéos de votre séance :", zip_url]
+    lines += ["", "À bientôt !", sender_name]
+    msg.set_content("\n".join(lines))
+    if port == 465:
+        server = smtplib.SMTP_SSL(host, port, timeout=20)
+    else:
+        server = smtplib.SMTP(host, port, timeout=20)
+        if st.secrets.get("SMTP_STARTTLS", True):
+            server.starttls()
+    with server:
+        if password:
+            server.login(user, password)
+        server.send_message(msg)
+
+
+def email_form(clip: dict):
+    """Un champ e-mail : l'invite saisit son adresse et recoit le lien (l'adresse n'est pas conservee)."""
+    if not mail_configured():
+        return
+    with st.form(f"mail_form_{clip['path']}", clear_on_submit=True):
+        address = st.text_input("📧 Recevoir le lien par e-mail", placeholder="adresse@exemple.fr")
+        sent = st.form_submit_button("Envoyer le lien")
+    if not sent:
+        return
+    address = (address or "").strip()
+    if not EMAIL_RE.match(address):
+        st.error("Adresse e-mail non valide.")
+        return
+    try:
+        with st.spinner("Envoi…"):
+            send_video_email(address, clip["s3_url"], session_state.get("zipped_clips_s3_url") if len(session_state.clips) > 1 else None)
+        st.success(f"Lien envoyé à {address}. Pensez à regarder les courriers indésirables.")
+    except Exception as exc:
+        st.error(f"Envoi impossible ({type(exc).__name__}). Vérifiez le réseau et réessayez ; le QR code reste valable.")
 
 
 def generate_qr_code(url: str) -> BytesIO:
