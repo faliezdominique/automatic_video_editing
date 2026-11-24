@@ -66,7 +66,7 @@ def main():
     new_session_section()
     library_section()
     save_state()
-    st.caption("Version du 24/11/2026 — 10h15")
+    st.caption("Version du 24/11/2026 — 11h00")
     # Espace en bas de page : le gros bouton fixe ne masque pas le contenu
     st.markdown('<div style="height: 180px"></div>', unsafe_allow_html=True)
 
@@ -1900,6 +1900,10 @@ def display_history():
         with qr_col:
             for clip in entry["clips"]:
                 st.image(generate_qr_code(clip["s3_url"]), width=120)
+        if mail_configured():
+            with st.expander("📧 Envoyer le lien par e-mail (si le QR code ne marche pas)"):
+                for i, clip in enumerate(entry["clips"]):
+                    email_form(clip["s3_url"], f"hist_{entry.get('number', entry['time'])}_{entry['time']}_{i}")
 
 
 def make_video_stem(event: str, serie_number: int, audio_name: str, multiple_tracks: bool) -> str:
@@ -2101,7 +2105,10 @@ def display_video(clip: dict):
         with qrcode_col:
             qr_img = generate_qr_code(clip["s3_url"])
             st.image(qr_img, caption="Scannez pour récupérer la vidéo")
-        email_form(clip)
+        email_form(
+            clip["s3_url"], clip["path"],
+            session_state.get("zipped_clips_s3_url") if len(session_state.clips) > 1 else None,
+        )
 
 
 EMAIL_RE = re.compile(r"^[^@\s]+@[^@\s]+\.[^@\s]{2,}$")
@@ -2153,11 +2160,11 @@ def send_video_email(to_addr: str, url: str, zip_url: str = None) -> None:
         server.send_message(msg)
 
 
-def email_form(clip: dict):
+def email_form(url: str, form_key: str, zip_url: str = None):
     """Un champ e-mail : l'invite saisit son adresse et recoit le lien (l'adresse n'est pas conservee)."""
     if not mail_configured():
         return
-    with st.form(f"mail_form_{clip['path']}", clear_on_submit=True):
+    with st.form(f"mail_form_{form_key}", clear_on_submit=True):
         address = st.text_input("📧 Recevoir le lien par e-mail", placeholder="adresse@exemple.fr")
         sent = st.form_submit_button("Envoyer le lien")
     if not sent:
@@ -2168,7 +2175,7 @@ def email_form(clip: dict):
         return
     try:
         with st.spinner("Envoi…"):
-            send_video_email(address, clip["s3_url"], session_state.get("zipped_clips_s3_url") if len(session_state.clips) > 1 else None)
+            send_video_email(address, url, zip_url)
         st.success(f"Lien envoyé à {address}. Pensez à regarder les courriers indésirables.")
     except Exception as exc:
         st.error(f"Envoi impossible ({type(exc).__name__}). Vérifiez le réseau et réessayez ; le QR code reste valable.")
