@@ -66,7 +66,7 @@ def main():
     new_session_section()
     library_section()
     save_state()
-    st.caption("Version du 24/11/2026 — 11h00")
+    st.caption("Version du 24/11/2026 — 16h15")
     # Espace en bas de page : le gros bouton fixe ne masque pas le contenu
     st.markdown('<div style="height: 180px"></div>', unsafe_allow_html=True)
 
@@ -100,6 +100,7 @@ SETTINGS_PLAIN = [
     "auto_enhance_cb", "brightness_slider", "contrast_slider", "temperature_slider", "tint_slider",
     "sat_min_slider", "mute_checkbox", "fullscreen_cam", "cam_zoom_front", "cam_zoom_rear",
     "look_strength", "shadows_slider", "skin_slider", "reverse_cb", "multiply_cb",
+    "exposure_slider", "sharp_amount", "sharp_radius", "sharp_detail", "sharp_masking",
     1, 2,  # BPM et duree de la musique (voir tempo_keys)
     "last_music_0", "tempo_hint_0",
 ]
@@ -752,10 +753,32 @@ def looks_section():
         help="Atténue les petits défauts dans les zones de teinte peau, en gardant yeux, lèvres et cheveux nets. "
              "Repéré par la couleur : des objets de teinte chair peuvent être légèrement lissés aussi.",
     )
+    st.markdown("**Exposition et netteté** (type Lightroom, tous à zéro par défaut)")
+    exposure = st.slider(
+        "Exposition (vues)", min_value=-2.0, max_value=2.0, value=0.0, step=0.05, key="exposure_slider",
+        help="+0,55 = environ 46 % de lumière en plus. Calculé en lumière linéaire, comme Lightroom.",
+    )
+    sharp_amount = st.slider("Netteté : quantité", min_value=0, max_value=150, value=0, step=1, key="sharp_amount")
+    sharp_radius, sharp_detail, sharp_masking = 1.0, 25, 0
+    if sharp_amount > 0:
+        rad_col, det_col, mask_col = st.columns(3)
+        with rad_col:
+            sharp_radius = st.slider(
+                "Rayon", min_value=0.5, max_value=3.0, value=1.0, step=0.1, key="sharp_radius",
+                help="En pixels pour une photo de 2000 px de large ; s'adapte à la taille réelle de la photo.",
+            )
+        with det_col:
+            sharp_detail = st.slider("Détail", min_value=0, max_value=100, value=25, step=1, key="sharp_detail")
+        with mask_col:
+            sharp_masking = st.slider("Masquage", min_value=0, max_value=100, value=0, step=1, key="sharp_masking")
     session_state.extras = {
         "look": lut, "look_strength": strength / 100.0, "shadows": float(shadows), "skin": float(skin),
+        "exposure": float(exposure), "sharp_amount": float(sharp_amount), "sharp_radius": float(sharp_radius),
+        "sharp_detail": float(sharp_detail), "sharp_masking": float(sharp_masking),
     }
-    session_state.extras_sig = (choice, strength, shadows, skin)
+    session_state.extras_sig = (
+        choice, strength, shadows, skin, exposure, sharp_amount, sharp_radius, sharp_detail, sharp_masking
+    )
 
     if st.checkbox("➕ Ajouter ou supprimer mes looks (.cube)", key="look_manage_toggle"):
         st.caption(
